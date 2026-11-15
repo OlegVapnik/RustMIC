@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4C3BCF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- rounded square background -->
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#bg)"/>
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#gloss)"/>
+
+  <!-- microphone capsule -->
+  <rect x="404" y="236" width="176" height="320" rx="88" fill="#ffffff"/>
+  <!-- grille lines -->
+  <g stroke="#6d4fe0" stroke-opacity="0.35" stroke-width="14" stroke-linecap="round">
+    <line x1="444" y1="330" x2="540" y2="330"/>
+    <line x1="444" y1="386" x2="540" y2="386"/>
+    <line x1="444" y1="442" x2="540" y2="442"/>
+  </g>
+
+  <!-- cradle arc -->
+  <path d="M330 470 v40 a162 162 0 0 0 324 0 v-40"
+        fill="none" stroke="#ffffff" stroke-width="44" stroke-linecap="round"/>
+  <!-- stem -->
+  <line x1="492" y1="672" x2="492" y2="772" stroke="#ffffff" stroke-width="44" stroke-linecap="round"/>
+  <!-- base -->
+  <line x1="396" y1="790" x2="588" y2="790" stroke="#ffffff" stroke-width="44" stroke-linecap="round"/>
+
+  <!-- sound waves -->
+  <g fill="none" stroke="#ffffff" stroke-linecap="round">
+    <path d="M700 360 a120 120 0 0 1 0 168" stroke-width="38" stroke-opacity="0.95"/>
+    <path d="M774 300 a210 210 0 0 1 0 288" stroke-width="38" stroke-opacity="0.62"/>
+    <path d="M848 240 a300 300 0 0 1 0 408" stroke-width="38" stroke-opacity="0.32"/>
+  </g>
+</svg>

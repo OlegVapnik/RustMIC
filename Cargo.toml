@@ -1,0 +1,30 @@
+[package]
+name = "womic-mic"
+version = "0.1.0"
+edition = "2021"
+description = "WO Mic (Android) as a system microphone on Linux, with RNNoise denoise"
+
+[features]
+default = []
+gui = ["dep:gtk4", "dep:ksni"]
+
+[[bin]]
+name = "womic-mic"
+path = "src/main.rs"
+
+[[bin]]
+name = "womic-mic-gui"
+path = "src/bin/gui.rs"
+required-features = ["gui"]
+
+[dependencies]
+libc = "0.2"
+nnnoiseless = "0.5"
+gtk4 = { version = "0.11", optional = true }
+ksni = { version = "0.3", features = ["blocking"], optional = true }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
