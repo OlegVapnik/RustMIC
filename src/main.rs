@@ -15,6 +15,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,8 +40,39 @@ fn log(msg: &str) {
 
 // ---------------------------------------------------------------- pump
 
-fn pump(mut src: impl Read, sink: &mut dyn Sink, den: &mut Denoiser) -> io::Result<()> {
-    let mut raw = vec![0u8; 16 * 1024];
+/// Read a byte stream on its own thread so the supervisor can notice SIGTERM
+/// while it is waiting for audio (a blocking `read` would swallow the signal).
+fn reader(mut src: impl Read + Send + 'static) -> Receiver<io::Result<Vec<u8>>> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match src.read(&mut buf) {
+                Ok(0) => {
+                    let _ = tx.send(Ok(Vec::new()));
+                    return;
+                }
+                Ok(n) => {
+                    if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            }
+        }
+    });
+    rx
+}
+
+fn pump(
+    chunks: &Receiver<io::Result<Vec<u8>>>,
+    sink: &mut dyn Sink,
+    den: &mut Denoiser,
+) -> io::Result<()> {
     let mut carry: Option<u8> = None;
     let mut samples: Vec<i16> = Vec::with_capacity(8192);
     let mut out: Vec<i16> = Vec::with_capacity(8192);
@@ -48,19 +80,20 @@ fn pump(mut src: impl Read, sink: &mut dyn Sink, den: &mut Denoiser) -> io::Resu
         if STOP.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let n = match src.read(&mut raw) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+        let raw = match chunks.recv_timeout(Duration::from_millis(200)) {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(e)) => return Err(e),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         };
+        let n = raw.len();
+        if n == 0 {
+            return Ok(());
+        }
         samples.clear();
         out.clear();
         let mut idx = 0;
         if let Some(b) = carry.take() {
-            if n == 0 {
-                return Ok(());
-            }
             samples.push(i16::from_le_bytes([b, raw[0]]));
             idx = 1;
         }
@@ -101,7 +134,7 @@ fn session(cfg: &Settings, live: &Arc<RwLock<Live>>, stats: bool) -> Result<(), 
     den.stats = stats;
     let result = {
         let out = mic.stdout.take().expect("rustmic stdout");
-        pump(out, sink.as_mut(), &mut den)
+        pump(&reader(out), sink.as_mut(), &mut den)
     };
 
     let _ = mic.kill();
@@ -221,7 +254,7 @@ fn filter(cfg: &Settings, stats: bool) -> i32 {
     }));
     let mut den = Denoiser::new(live);
     den.stats = stats;
-    match pump(io::stdin().lock(), &mut StdoutSink, &mut den) {
+    match pump(&reader(io::stdin()), &mut StdoutSink, &mut den) {
         Ok(()) => 0,
         Err(error) => {
             log(&format!("filter error: {error}"));
