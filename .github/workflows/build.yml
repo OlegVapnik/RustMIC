@@ -1,0 +1,38 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: windows (gui + cli)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --features gui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: womic-mic-windows
+          path: |
+            target/release/womic-mic.exe
+            target/release/womic-mic-gui.exe
+          if-no-files-found: error
+
+  linux:
+    name: linux (cli)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: womic-mic-linux
+          path: target/release/womic-mic
+          if-no-files-found: error

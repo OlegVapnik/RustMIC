@@ -1,12 +1,16 @@
 [package]
 name = "womic-mic"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "WO Mic (Android) as a system microphone on Linux, with RNNoise denoise"
+description = "WO Mic (Android) as a system microphone on Linux and Windows, with RNNoise denoise"
+
+[lib]
+name = "womic_mic"
+path = "src/lib.rs"
 
 [features]
 default = []
-gui = ["dep:gtk4", "dep:ksni"]
+gui = ["dep:gtk4", "dep:ksni", "dep:eframe"]
 
 [[bin]]
 name = "womic-mic"
@@ -15,13 +19,19 @@ path = "src/main.rs"
 [[bin]]
 name = "womic-mic-gui"
 path = "src/bin/gui.rs"
-required-features = ["gui"]
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nnnoiseless = "0.5"
 gtk4 = { version = "0.11", optional = true }
 ksni = { version = "0.3", features = ["blocking"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+cpal = "0.18"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"], optional = true }
+
+[dependencies]
+ctrlc = "3.4"
+nnnoiseless = "0.5"
 
 [profile.release]
 opt-level = 3
