@@ -66,10 +66,49 @@ fn is_url(query: &str) -> bool {
         || lower.starts_with("soundcloud.com/")
 }
 
+/// Drop playlist/radio/timestamp junk from YouTube links: a single track is
+/// what we want, and `?list=RD...&start_radio=1` makes yt-dlp parse a whole
+/// radio playlist before playback starts (tens of seconds of silence).
+fn clean_url(query: &str) -> String {
+    let lower = query.to_lowercase();
+
+    if let Some(pos) = lower.find("youtube.com/watch?") {
+        let params = &query[pos + "youtube.com/watch?".len()..];
+        for pair in params.split('&') {
+            let mut kv = pair.splitn(2, '=');
+            if kv.next() == Some("v") {
+                if let Some(id) = kv.next() {
+                    let id = id.split('#').next().unwrap_or(id);
+                    if !id.is_empty() {
+                        return format!("https://www.youtube.com/watch?v={id}");
+                    }
+                }
+            }
+        }
+    }
+
+    if lower.contains("youtu.be/") || lower.contains("youtube.com/shorts/") {
+        let marker = if lower.contains("youtu.be/") {
+            "youtu.be/"
+        } else {
+            "youtube.com/shorts/"
+        };
+        if let Some(pos) = lower.find(marker) {
+            let rest = &query[pos + marker.len()..];
+            let id = rest.split(['?', '&', '#']).next().unwrap_or("");
+            if !id.is_empty() {
+                return format!("https://youtu.be/{id}");
+            }
+        }
+    }
+
+    query.trim().to_string()
+}
+
 fn resolve_query(query: &str) -> String {
-    let query = query.trim();
-    if is_url(query) {
-        query.to_string()
+    let query = clean_url(query);
+    if is_url(&query) {
+        query
     } else {
         format!("ytsearch1:{query}")
     }
@@ -195,14 +234,16 @@ pub fn play(settings: &Settings, query: &str) -> Result<String, String> {
         .args([
             "--no-config",
             "--no-video",
-            "--no-terminal",
+            "--input-terminal=no",
             "--loop-file=no",
             "--keep-open=no",
             "--force-window=no",
-            "--audio-device",
-            &audio_device,
+            "--cache=yes",
+            "--cache-secs=30",
+            "--demuxer-readahead-secs=20",
             "--msg-level=all=warn",
         ])
+        .arg(format!("--audio-device={audio_device}"))
         .arg(resolve_query(query))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -243,6 +284,7 @@ pub fn now_playing() -> Option<String> {
     if !alive(pid) {
         let _ = fs::remove_file(pid_path());
         let _ = fs::remove_file(query_path());
+        unlink();
         return None;
     }
     fs::read_to_string(query_path()).ok().map(|text| {
@@ -267,6 +309,22 @@ mod tests {
         assert_eq!(
             resolve_query("https://youtu.be/x"),
             "https://youtu.be/x"
+        );
+    }
+
+    #[test]
+    fn youtube_playlist_junk_is_stripped() {
+        assert_eq!(
+            resolve_query("https://www.youtube.com/watch?v=u_WMfX-8toE&list=RDu_WMfX-8toE&start_radio=1"),
+            "https://www.youtube.com/watch?v=u_WMfX-8toE"
+        );
+        assert_eq!(
+            resolve_query("https://youtu.be/abc123?t=42"),
+            "https://youtu.be/abc123"
+        );
+        assert_eq!(
+            resolve_query("https://www.youtube.com/shorts/abc123?feature=share"),
+            "https://youtu.be/abc123"
         );
     }
 }
