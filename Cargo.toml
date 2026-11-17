@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-gui = ["dep:ksni", "dep:eframe", "dep:tray-icon"]
+gui = ["dep:ksni", "dep:eframe", "dep:tray-icon", "dep:egui_extras", "dep:image"]
 
 [[bin]]
 name = "RustMIC"
@@ -32,6 +32,8 @@ tray-icon = { version = "0.21", optional = true }
 
 [dependencies]
 ctrlc = "3.4"
+egui_extras = { version = "0.37", features = ["file", "image"], optional = true }
+image = { version = "0.25", features = ["jpeg", "png"], optional = true }
 interprocess = "2.4"
 nnnoiseless = "0.5"
 serde = { version = "1", features = ["derive"] }

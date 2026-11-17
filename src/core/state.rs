@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{GateMode, Settings};
-use crate::{level, music};
+use crate::{level, music, tiles};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -156,11 +156,8 @@ impl AppState {
             vad: meter.vad,
             gate_open: meter.gate_open,
         };
-        self.track = music::now_playing().map(|query| TrackState {
-            title: query.clone(),
-            query,
-            ..TrackState::default()
-        });
+        self.track = music::status();
+        self.tiles = tiles::load();
         self.updated_at = now();
     }
 }

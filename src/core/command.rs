@@ -26,9 +26,12 @@ pub enum Command {
     SetMuted { muted: bool },
     SetLoudnorm { enabled: bool },
     SetDucking { enabled: bool },
+    SetDuckingDb { value: f32 },
     SetMonitor { enabled: bool },
     Play { query: String },
     StopMusic,
+    AddTile { title: String, query: String },
+    RemoveTile { tile_id: String },
     Pause { paused: bool },
     Seek { seconds: f64 },
     Restart,
@@ -50,9 +53,12 @@ impl Command {
             Self::SetMuted { .. } => "set_muted",
             Self::SetLoudnorm { .. } => "set_loudnorm",
             Self::SetDucking { .. } => "set_ducking",
+            Self::SetDuckingDb { .. } => "set_ducking_db",
             Self::SetMonitor { .. } => "set_monitor",
             Self::Play { .. } => "play",
             Self::StopMusic => "stop_music",
+            Self::AddTile { .. } => "add_tile",
+            Self::RemoveTile { .. } => "remove_tile",
             Self::Pause { .. } => "pause",
             Self::Seek { .. } => "seek",
             Self::Restart => "restart",
@@ -133,6 +139,20 @@ mod tests {
                 query: "https://youtu.be/abc".to_string()
             }
         );
+    }
+
+    #[test]
+    fn remove_tile_does_not_clash_with_envelope_id() {
+        let message = CommandMessage::with_id(
+            42,
+            Command::RemoveTile {
+                tile_id: "tile-1".to_string(),
+            },
+        );
+        let text = serde_json::to_string(&message).unwrap();
+        assert_eq!(text.matches("\"id\"").count(), 1, "{text}");
+        let back: CommandMessage = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, message);
     }
 
     #[test]

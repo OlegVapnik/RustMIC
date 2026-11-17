@@ -21,6 +21,7 @@ pub mod level;
 pub mod logging;
 pub mod music;
 pub mod platform;
+pub mod tiles;
 
 use std::sync::atomic::AtomicBool;
 

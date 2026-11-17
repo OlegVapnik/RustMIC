@@ -24,7 +24,7 @@ use rustmic_mic::audio::{self, Sink};
 use rustmic_mic::config::{self, GateMode, Settings};
 use rustmic_mic::core::{AppState, Command};
 use rustmic_mic::denoise::{Denoiser, Live};
-use rustmic_mic::{adb, ipc, level, logging, music, platform, STOP};
+use rustmic_mic::{adb, ipc, level, logging, music, platform, tiles, STOP};
 
 fn install_signals() {
     #[cfg(unix)]
@@ -300,6 +300,8 @@ fn run(cfg: Settings, stats: bool) -> i32 {
     let pidfile = config::pid_path();
     let _ = fs::write(&pidfile, std::process::id().to_string());
     level::clear();
+    music::configure(&cfg);
+    music::start_control();
 
     #[cfg(unix)]
     rustmic_mic::audio::linux::set_source_volume(cfg.mic_volume);
@@ -324,6 +326,8 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 };
+                let command_name = command.name().to_string();
+                log(&format!("command {command_name} (id={id})"));
                 let mut settings = Settings::load();
                 let mut muted = live.read().map(|live| live.muted).unwrap_or(false);
                 let mut save = false;
@@ -365,9 +369,20 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                         settings.ducking = enabled;
                         save = true;
                     }
+                    Command::SetDuckingDb { value } => {
+                        settings.ducking_db = value.clamp(0.0, 30.0);
+                        save = true;
+                    }
                     Command::SetMonitor { enabled } => {
                         settings.monitor_music = enabled;
                         save = true;
+                    }
+                    Command::AddTile { title, query } => {
+                        let list = tiles::add(&title, &query, None, 0.0);
+                        log(&format!("tile added: {} ({})", title, list.len()));
+                    }
+                    Command::RemoveTile { tile_id } => {
+                        tiles::remove(&tile_id);
                     }
                     Command::Play { query } => {
                         if let Err(error) = music::play(&settings, &query) {
@@ -379,8 +394,15 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                             log(&format!("stop-music failed: {error}"));
                         }
                     }
-                    Command::Pause { .. } | Command::Seek { .. } => {
-                        log("pause/seek: mpv IPC появится в следующем шаге");
+                    Command::Pause { paused } => {
+                        if !music::set_paused(paused) {
+                            log("pause: mpv IPC is not available");
+                        }
+                    }
+                    Command::Seek { seconds } => {
+                        if !music::seek(seconds) {
+                            log("seek: mpv IPC is not available");
+                        }
                     }
                     Command::Restart => {
                         if let Err(error) = platform::restart() {
@@ -403,12 +425,14 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                         log(&format!("cannot save settings: {error}"));
                     }
                 }
+                music::configure(&settings);
                 update_live(&live, &settings, muted);
                 if let Ok(mut state) = state.write() {
                     state.refresh(&settings);
                     state.audio.muted = muted;
                     state.last_command_id = id;
                 }
+                log(&format!("command {command_name} applied (id={id})"));
             }
         });
     }
@@ -487,6 +511,7 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                 stamp = now;
                 let settings = Settings::load();
                 let muted = live.read().map(|live| live.muted).unwrap_or(false);
+                music::configure(&settings);
                 update_live(&live, &settings, muted);
                 #[cfg(unix)]
                 rustmic_mic::audio::linux::set_source_volume(settings.mic_volume);
@@ -615,6 +640,22 @@ fn ctl(args: &[String]) -> i32 {
         },
         "ducking" => Command::SetDucking {
             enabled: parse_bool(value),
+        },
+        "ducking-db" => Command::SetDuckingDb {
+            value: value.parse::<f32>().unwrap_or(12.0).clamp(0.0, 30.0),
+        },
+        "tile-add" => {
+            if args.len() < 3 {
+                log("ctl tile-add: нужен заголовок и ссылка/название");
+                return 2;
+            }
+            Command::AddTile {
+                title: value.to_string(),
+                query: args[2..].join(" "),
+            }
+        }
+        "tile-remove" => Command::RemoveTile {
+            tile_id: value.to_string(),
         },
         "monitor" => Command::SetMonitor {
             enabled: parse_bool(value),

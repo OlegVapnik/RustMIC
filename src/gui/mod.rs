@@ -101,6 +101,8 @@ struct App {
     last_frame: Instant,
     audio_edit_until: Instant,
     music_query: String,
+    tile_title: String,
+    tile_query: String,
     diagnostics: Option<String>,
     notice: Option<(String, Instant)>,
     busy_since: Option<Instant>,
@@ -119,6 +121,7 @@ impl Drop for App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_theme(&cc.egui_ctx);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
 
         let settings = Settings::load();
         let state = AppState::from_settings(&settings);
@@ -158,6 +161,8 @@ impl App {
             last_frame: Instant::now(),
             audio_edit_until: Instant::now(),
             music_query: String::new(),
+            tile_title: String::new(),
+            tile_query: String::new(),
             diagnostics: None,
             notice: None,
             busy_since: None,
@@ -204,6 +209,7 @@ impl App {
         self.settings.music_volume = self.state.audio.music_volume;
         self.settings.loudnorm = self.state.audio.loudnorm;
         self.settings.ducking = self.state.audio.ducking;
+        self.settings.ducking_db = self.state.audio.ducking_db;
         self.settings.monitor_music = self.state.audio.monitor_music;
     }
 
@@ -709,18 +715,38 @@ impl App {
         }
 
         card(ui, "Сейчас играет", |ui| {
-            if let Some(track) = &self.state.track {
-                ui.label(
-                    RichText::new(if track.title.is_empty() {
-                        track.query.clone()
+            let track = self.state.track.clone();
+            if let Some(track) = track {
+                ui.horizontal(|ui| {
+                    if let Some(cover) = track.cover.clone() {
+                        ui.add(
+                            egui::Image::from_uri(cover)
+                                .fit_to_exact_size(Vec2::splat(56.0))
+                                .corner_radius(6.0),
+                        );
                     } else {
-                        track.title.clone()
-                    })
-                    .size(17.0)
-                    .family(semibold())
-                    .color(TEXT),
-                );
-                ui.label(small(track.query.clone()));
+                        ui.add_sized(
+                            [56.0, 56.0],
+                            egui::Label::new(
+                                RichText::new("♪").size(26.0).color(ACCENT).family(semibold()),
+                            )
+                            .truncate(),
+                        );
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(if track.title.is_empty() {
+                                track.query.clone()
+                            } else {
+                                track.title.clone()
+                            })
+                            .size(16.0)
+                            .family(semibold())
+                            .color(TEXT),
+                        );
+                        ui.label(small(track.query.clone()));
+                    });
+                });
                 ui.add_space(8.0);
                 let fraction = if track.duration > 0.0 {
                     (track.position / track.duration).clamp(0.0, 1.0) as f32
@@ -742,11 +768,17 @@ impl App {
                         if ui.button("Стоп").clicked() {
                             let _ = self.commands.send(crate::core::Command::StopMusic);
                         }
-                        let pause = ui.add_enabled(
-                            false,
-                            egui::Button::new(if track.paused { "Продолжить" } else { "Пауза" }),
-                        );
-                        pause.on_hover_text("Пауза и перемотка появятся на шаге 3");
+                        if ui.button(if track.paused { "▶" } else { "Ⅱ" }).clicked() {
+                            let _ = self.commands.send(crate::core::Command::Pause {
+                                paused: !track.paused,
+                            });
+                        }
+                        if ui.button("+10").clicked() {
+                            let _ = self.commands.send(crate::core::Command::Seek { seconds: 10.0 });
+                        }
+                        if ui.button("-10").clicked() {
+                            let _ = self.commands.send(crate::core::Command::Seek { seconds: -10.0 });
+                        }
                     });
                 });
             } else {
@@ -780,30 +812,64 @@ impl App {
 
         ui.add_space(12.0);
         card(ui, "Плитки", |ui| {
-            ui.label(small(
-                "Пока это быстрый запуск: добавьте трек из поля выше. Плитки с обложками и громкостью — шаг 3.",
-            ));
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.tile_title)
+                        .hint_text("Название")
+                        .desired_width(140.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.tile_query)
+                        .hint_text("ссылка или название трека")
+                        .desired_width(ui.available_width() - 96.0),
+                );
+                if ui.button("+").clicked() {
+                    let title = self.tile_title.clone();
+                    let query = self.tile_query.clone();
+                    if !query.trim().is_empty() {
+                        let _ = self.commands.send(crate::core::Command::AddTile { title, query });
+                        self.tile_title.clear();
+                        self.tile_query.clear();
+                    }
+                }
+            });
             ui.add_space(8.0);
-            if self.state.tiles.is_empty() {
+            let tiles = self.state.tiles.clone();
+            if tiles.is_empty() {
                 ui.label(RichText::new("Плиток пока нет").color(MUTED));
             } else {
                 let mut play: Option<String> = None;
+                let mut remove: Option<String> = None;
                 egui::Grid::new("tiles")
                     .num_columns(2)
                     .spacing([8.0, 8.0])
                     .show(ui, |ui| {
-                        for tile in &self.state.tiles {
-                            if ui
-                                .add_sized(
-                                    [ui.available_width() * 0.47, 54.0],
-                                    egui::Button::new(&tile.title),
-                                )
-                                .clicked()
-                            {
-                                play = Some(tile.query.clone());
+                        for (index, tile) in tiles.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width() - 28.0, 44.0],
+                                        egui::Button::new(&tile.title),
+                                    )
+                                    .clicked()
+                                {
+                                    play = Some(tile.query.clone());
+                                }
+                                if ui.button("×").clicked() {
+                                    remove = Some(tile.id.clone());
+                                }
+                            });
+                            if index % 2 == 1 {
+                                ui.end_row();
                             }
                         }
                     });
+                if tiles.len() % 2 == 1 {
+                    // Grid needs a trailing cell to keep the last row aligned.
+                }
+                if let Some(id) = remove {
+                    let _ = self.commands.send(crate::core::Command::RemoveTile { tile_id: id });
+                }
                 if let Some(query) = play {
                     self.play(query);
                 }
@@ -984,48 +1050,75 @@ impl App {
             }
 
             let mut music_volume = self.state.audio.music_volume;
-            let response = ui.add_enabled(
-                false,
+            let response = ui.add(
                 egui::Slider::new(&mut music_volume, 0..=100)
-                    .text("Музыка (шаг 3)")
+                    .text("Музыка")
                     .suffix("%"),
             );
-            let _ = response;
+            if response.changed() {
+                self.state.audio.music_volume = music_volume;
+                self.settings.music_volume = music_volume;
+                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
+            }
+            if response.drag_stopped()
+                || (response.changed() && !ui.input(|i| i.pointer.any_down()))
+            {
+                let _ = self
+                    .commands
+                    .send(crate::core::Command::SetMusicVolume { value: music_volume });
+            }
 
             ui.add_space(4.0);
             let mut loudnorm = self.state.audio.loudnorm;
-            if ui
-                .add_enabled(false, egui::Checkbox::new(&mut loudnorm, "Loudnorm (шаг 3)"))
-                .changed()
-            {
+            if ui.checkbox(&mut loudnorm, "Выравнивание громкости (loudnorm)").changed() {
                 self.state.audio.loudnorm = loudnorm;
+                self.settings.loudnorm = loudnorm;
+                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
                 let _ = self.commands.send(crate::core::Command::SetLoudnorm {
                     enabled: loudnorm,
                 });
             }
             let mut ducking = self.state.audio.ducking;
             if ui
-                .add_enabled(
-                    false,
-                    egui::Checkbox::new(&mut ducking, "Приглушать музыку под голос (шаг 3)"),
-                )
+                .checkbox(&mut ducking, "Приглушать музыку, когда гейт открыт")
                 .changed()
             {
                 self.state.audio.ducking = ducking;
+                self.settings.ducking = ducking;
+                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
                 let _ = self
                     .commands
                     .send(crate::core::Command::SetDucking { enabled: ducking });
             }
+            if self.state.audio.ducking {
+                let mut ducking_db = self.state.audio.ducking_db;
+                let response = ui.add(
+                    egui::Slider::new(&mut ducking_db, 0.0..=30.0)
+                        .text("Затухание")
+                        .suffix(" dB"),
+                );
+                if response.changed() {
+                    self.state.audio.ducking_db = ducking_db;
+                    self.settings.ducking_db = ducking_db;
+                    self.audio_edit_until = Instant::now() + Duration::from_millis(700);
+                }
+                if response.drag_stopped()
+                    || (response.changed() && !ui.input(|i| i.pointer.any_down()))
+                {
+                    let _ = self
+                        .commands
+                        .send(crate::core::Command::SetDuckingDb { value: ducking_db });
+                }
+            }
             let mut monitor = self.state.audio.monitor_music;
             if !cfg!(windows) {
                 if ui
-                    .add_enabled(
-                        false,
-                        egui::Checkbox::new(&mut monitor, "Слышать музыку в колонках (шаг 3)"),
-                    )
+                    .checkbox(&mut monitor, "Слышать музыку в колонках")
                     .changed()
                 {
                     self.state.audio.monitor_music = monitor;
+                    self.settings.monitor_music = monitor;
+                    self.audio_edit_until = Instant::now() + Duration::from_millis(700);
                     let _ = self
                         .commands
                         .send(crate::core::Command::SetMonitor { enabled: monitor });
@@ -1033,7 +1126,7 @@ impl App {
             } else {
                 ui.add_enabled(
                     false,
-                    egui::Checkbox::new(&mut monitor, "Мониторинг: только Linux (шаг 3)"),
+                    egui::Checkbox::new(&mut monitor, "Мониторинг только на Linux"),
                 );
             }
         });

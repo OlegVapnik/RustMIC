@@ -69,7 +69,14 @@ pub fn start_server(
         .spawn(move || {
             for connection in listener.incoming() {
                 match connection {
-                    Ok(stream) => serve_connection(stream, &state, &commands),
+                    Ok(stream) => {
+                        // Never serve a client on the accept thread: one long-lived
+                        // GUI connection would otherwise block every other client
+                        // (CLI, tray, a second window) forever.
+                        let state = Arc::clone(&state);
+                        let commands = commands.clone();
+                        thread::spawn(move || serve_connection(stream, &state, &commands));
+                    }
                     Err(error) => {
                         logging::log(&format!("ipc: accept failed: {error}"));
                         thread::sleep(TICK);
