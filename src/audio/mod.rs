@@ -1,7 +1,7 @@
 //! Audio output: where the denoised PCM goes.
 //!
-//! * Linux: a `pacat` child writes into the `womic_sink` null sink, which a
-//!   remap source exposes as `womic_mic`.
+//! * Linux: a `pacat` child writes into the `rustmic_sink` null sink, which a
+//!   remap source exposes as `rustmic_mic`.
 //! * Windows: WASAPI playback into a virtual audio cable (VB-CABLE by
 //!   default); recording apps pick the cable's capture side.
 
@@ -82,10 +82,10 @@ pub fn set_default(on: bool) -> Result<(), String> {
     }
 }
 
-pub fn default_is_womic() -> bool {
+pub fn default_is_rustmic() -> bool {
     #[cfg(unix)]
     {
-        linux::default_is_womic()
+        linux::default_is_rustmic()
     }
     #[cfg(windows)]
     {

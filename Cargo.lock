@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "RustMIC"
+version = "0.2.0"
+dependencies = [
+ "cpal",
+ "ctrlc",
+ "eframe",
+ "gtk4",
+ "ksni",
+ "libc",
+ "nnnoiseless",
+]
+
+[[package]]
 name = "accesskit"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3412,19 +3425,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "womic-mic"
-version = "0.2.0"
-dependencies = [
- "cpal",
- "ctrlc",
- "eframe",
- "gtk4",
- "ksni",
- "libc",
- "nnnoiseless",
 ]
 
 [[package]]

@@ -1,11 +1,14 @@
-//! womic-mic-gui — tray icon + settings window for the womic-mic daemon.
+//! RustMIC-gui — tray icon + settings window for the RustMIC daemon.
 //!
 //! The GUI never touches the audio path itself: it controls the systemd unit
 //! (start/stop), writes the settings file the daemon reads live, and shows a
 //! level meter by listening to the monitor of the virtual sink.
 
 use gtk::prelude::*;
-use gtk::{glib, Application, ApplicationWindow, Label, Orientation, ProgressBar, Scale, Switch};
+use gtk::{
+    glib, Application, ApplicationWindow, Button, DropDown, Entry, Label, Orientation, ProgressBar,
+    Scale, Switch,
+};
 use gtk4 as gtk;
 
 use std::cell::{Cell, RefCell};
@@ -17,8 +20,8 @@ use std::time::Duration;
 
 use ksni::blocking::TrayMethods;
 
-use womic_mic::config::Settings;
-use womic_mic::{adb, audio, config, platform};
+use rustmic_mic::config::Settings;
+use rustmic_mic::{adb, audio, config, platform};
 
 // ---------------------------------------------------------------- helpers
 
@@ -49,14 +52,53 @@ fn service_active() -> bool {
     platform::service_active()
 }
 
-/// Only a device attached over USB counts.
-fn usb_phone() -> Option<String> {
-    adb::usb_phone(&settings().adb)
-        .map(|phone| phone.model.unwrap_or_else(|| "телефон".into()))
+/// Run our own CLI in a thread so the GTK loop never blocks on mpv startup.
+fn run_cli(args: &[&str]) {
+    let exe = config::program_dir().join(if cfg!(windows) { "RustMIC.exe" } else { "RustMIC" });
+    let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    thread::spawn(move || {
+        let _ = rustmic_mic::command(&exe)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
+}
+
+/// Connection details for the currently selected transport.
+fn link_info(cfg: &Settings) -> Option<String> {
+    match cfg.transport.as_str() {
+        "wifi" | "wifi-direct" => {
+            if cfg.host.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.host.clone())
+            }
+        }
+        "bluetooth" => {
+            if cfg.bt_address.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.bt_address.clone())
+            }
+        }
+        _ => adb::usb_phone(&cfg.adb)
+            .map(|phone| phone.model.unwrap_or_else(|| "телефон".into())),
+    }
+}
+
+fn link_label(cfg: &Settings) -> &'static str {
+    match cfg.transport.as_str() {
+        "wifi" => "Телефон (Wi-Fi)",
+        "wifi-direct" => "Телефон (Wi-Fi Direct)",
+        "bluetooth" => "Телефон (Bluetooth)",
+        _ => "Телефон (USB)",
+    }
 }
 
 fn phone_connected() -> bool {
-    usb_phone().is_some()
+    link_info(&settings()).is_some()
 }
 
 /// Is the rustmic client alive right now? Checked through /proc so the poller
@@ -81,8 +123,8 @@ fn client_running() -> bool {
     false
 }
 
-fn default_is_womic() -> bool {
-    audio::default_is_womic()
+fn default_is_rustmic() -> bool {
+    audio::default_is_rustmic()
 }
 
 fn set_default(on: bool) {
@@ -130,18 +172,18 @@ struct Tray {
 
 impl ksni::Tray for Tray {
     fn id(&self) -> String {
-        "womic-mic".into()
+        "RustMIC".into()
     }
 
     fn title(&self) -> String {
-        "WO Mic".into()
+        "RustMIC".into()
     }
 
     fn icon_name(&self) -> String {
         if self.service && self.client {
-            "womic-mic".into()
+            "RustMIC".into()
         } else {
-            "womic-mic-off".into()
+            "RustMIC-off".into()
         }
     }
 
@@ -153,7 +195,7 @@ impl ksni::Tray for Tray {
             (true, true, true) => "микрофон работает",
         };
         ksni::ToolTip {
-            title: "WO Mic".into(),
+            title: "RustMIC".into(),
             description: state.into(),
             ..Default::default()
         }
@@ -287,12 +329,14 @@ fn spawn_level_meter(tx: Sender<f32>) {
 
 struct Ui {
     window: ApplicationWindow,
+    status_link_label: Label,
     status_phone: Label,
     status_client: Label,
     status_service: Label,
     level: ProgressBar,
     sw_mic: Switch,
     sw_default: Switch,
+    music_now: Label,
     guard: Rc<Cell<bool>>,
 }
 
@@ -318,7 +362,7 @@ fn build_ui(app: &Application) -> Rc<Ui> {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("WO Mic")
+        .title("RustMIC")
         .default_width(480)
         .default_height(760)
         .build();
@@ -332,7 +376,7 @@ fn build_ui(app: &Application) -> Rc<Ui> {
 
     let hero = gtk::Box::new(Orientation::Horizontal, 12);
     let brand = gtk::Box::new(Orientation::Vertical, 3);
-    let title = Label::new(Some("WO Mic"));
+    let title = Label::new(Some("RustMIC"));
     title.add_css_class("title-1");
     title.set_xalign(0.0);
     let subtitle = Label::new(Some("Android-телефон как микрофон Linux"));
@@ -377,6 +421,7 @@ fn build_ui(app: &Application) -> Rc<Ui> {
         .margin_end(12)
         .build();
 
+    let status_link_label = Label::new(Some(link_label(&settings())));
     let status_phone = Label::new(Some("—"));
     let status_client = Label::new(Some("—"));
     let status_service = Label::new(Some("—"));
@@ -384,7 +429,7 @@ fn build_ui(app: &Application) -> Rc<Ui> {
     level.set_show_text(false);
     level.set_size_request(-1, 8);
 
-    grid.attach(&Label::new(Some("Телефон (USB)")), 0, 0, 1, 1);
+    grid.attach(&status_link_label, 0, 0, 1, 1);
     grid.attach(&status_phone, 1, 0, 1, 1);
     grid.attach(&Label::new(Some("Поток")), 0, 1, 1, 1);
     grid.attach(&status_client, 1, 1, 1, 1);
@@ -412,8 +457,80 @@ fn build_ui(app: &Application) -> Rc<Ui> {
     settings_notice.set_visible(false);
     let current = settings();
 
+    // Connection: no cable needed for Wi-Fi / Wi-Fi Direct / Bluetooth.
+    let transport_drop = DropDown::from_strings(config::TRANSPORTS);
+    transport_drop.set_selected(
+        config::TRANSPORTS
+            .iter()
+            .position(|transport| *transport == current.transport)
+            .unwrap_or(0) as u32,
+    );
+    {
+        let notice = settings_notice.clone();
+        transport_drop.connect_selected_notify(move |drop| {
+            let choice = config::TRANSPORTS
+                .get(drop.selected() as usize)
+                .copied()
+                .unwrap_or("usb");
+            let mut next = settings();
+            next.transport = choice.to_string();
+            match save(&next) {
+                Ok(()) => restart_service(),
+                Err(error) => {
+                    notice.set_text(&format!("Не удалось сохранить настройки: {error}"));
+                    notice.set_visible(true);
+                }
+            }
+        });
+    }
+    cfg_box.append(&row("Подключение", &transport_drop));
+
+    let host_entry = Entry::new();
+    host_entry.set_text(&current.host);
+    host_entry.set_placeholder_text(Some("IP телефона, например 192.168.1.50"));
+    host_entry.set_tooltip_text(Some("Wi-Fi / Wi-Fi Direct: IP WO Mic на телефоне. Enter — перезапуск."));
+    {
+        let notice = settings_notice.clone();
+        host_entry.connect_changed(move |entry| {
+            let mut next = settings();
+            let text = entry.text().to_string();
+            if next.host == text {
+                return;
+            }
+            next.host = text;
+            if let Err(error) = save(&next) {
+                notice.set_text(&format!("Не удалось сохранить настройки: {error}"));
+                notice.set_visible(true);
+            }
+        });
+        host_entry.connect_activate(|_| restart_service());
+    }
+    cfg_box.append(&row("Хост (Wi-Fi)", &host_entry));
+
+    let bt_entry = Entry::new();
+    bt_entry.set_text(&current.bt_address);
+    bt_entry.set_placeholder_text(Some("AA:BB:CC:DD:EE:FF"));
+    bt_entry.set_tooltip_text(Some("Bluetooth: MAC-адрес телефона. Enter — перезапуск."));
+    {
+        let notice = settings_notice.clone();
+        bt_entry.connect_changed(move |entry| {
+            let mut next = settings();
+            let text = entry.text().to_string();
+            if next.bt_address == text {
+                return;
+            }
+            next.bt_address = text;
+            if let Err(error) = save(&next) {
+                notice.set_text(&format!("Не удалось сохранить настройки: {error}"));
+                notice.set_visible(true);
+            }
+        });
+        bt_entry.connect_activate(|_| restart_service());
+    }
+    cfg_box.append(&row("Bluetooth MAC", &bt_entry));
+
     let sw_default = Switch::new();
-    sw_default.set_active(default_is_womic());
+    sw_default.set_active(default_is_rustmic());
     {
         let guard = guard.clone();
         sw_default.connect_state_set(move |_, on| {
@@ -442,7 +559,7 @@ fn build_ui(app: &Application) -> Rc<Ui> {
                     Err(error) => {
                         notice.set_text(&format!("Не удалось сохранить настройки: {error}"));
                         notice.set_visible(true);
-                        eprintln!("womic-mic-gui: cannot save settings: {error}");
+                        eprintln!("RustMIC-gui: cannot save settings: {error}");
                     }
                 }
             }
@@ -477,7 +594,7 @@ fn build_ui(app: &Application) -> Rc<Ui> {
             if let Err(error) = save(&next) {
                 notice.set_text(&format!("Не удалось сохранить настройки: {error}"));
                 notice.set_visible(true);
-                eprintln!("womic-mic-gui: cannot save settings: {error}");
+                eprintln!("RustMIC-gui: cannot save settings: {error}");
                 return;
             }
             notice.set_visible(false);
@@ -537,7 +654,7 @@ fn build_ui(app: &Application) -> Rc<Ui> {
                 label.set_tooltip_text(Some(&format!("Не удалось сохранить: {error}")));
                 notice.set_text(&format!("Не удалось сохранить настройки: {error}"));
                 notice.set_visible(true);
-                eprintln!("womic-mic-gui: cannot save settings: {error}");
+                eprintln!("RustMIC-gui: cannot save settings: {error}");
                 return;
             }
             notice.set_visible(false);
@@ -578,6 +695,44 @@ fn build_ui(app: &Application) -> Rc<Ui> {
     volume_frame.set_child(Some(&volume_box));
     root.append(&volume_frame);
 
+    // --- music straight into the microphone
+    let music_frame = gtk::Frame::builder().label("Музыка в микрофон").build();
+    music_frame.add_css_class("card");
+    let music_box = gtk::Box::new(Orientation::Vertical, 8);
+    music_box.set_margin_top(10);
+    music_box.set_margin_bottom(10);
+    music_box.set_margin_start(12);
+    music_box.set_margin_end(12);
+    let music_note = Label::new(Some("Название или ссылка YouTube / YouTube Music / SoundCloud  — играет сразу в микрофон, файл скачивать не надо"));
+    music_note.set_xalign(0.0);
+    music_note.set_wrap(true);
+    music_note.add_css_class("dim-label");
+    let music_entry = Entry::new();
+    music_entry.set_placeholder_text(Some("например: Harvest Moon или https://youtu.be/..."));
+    let music_now = Label::new(Some("ничего не играет"));
+    music_now.set_xalign(0.0);
+    music_now.add_css_class("dim-label");
+    let music_buttons = gtk::Box::new(Orientation::Horizontal, 8);
+    let btn_play = Button::with_label("Играть");
+    let query_entry = music_entry.clone();
+    btn_play.connect_clicked(move |_| {
+        let query = query_entry.text().to_string();
+        if query.trim().is_empty() {
+            return;
+        }
+        run_cli(&["play", &query]);
+    });
+    let btn_stop = Button::with_label("Стоп");
+    btn_stop.connect_clicked(|_| run_cli(&["stop-music"]));
+    music_buttons.append(&btn_play);
+    music_buttons.append(&btn_stop);
+    music_box.append(&music_note);
+    music_box.append(&music_entry);
+    music_box.append(&music_buttons);
+    music_box.append(&music_now);
+    music_frame.set_child(Some(&music_box));
+    root.append(&music_frame);
+
     // --- actions
     let actions = gtk::Grid::builder()
         .column_spacing(8)
@@ -586,7 +741,7 @@ fn build_ui(app: &Application) -> Rc<Ui> {
         .build();
 
     let btn_restart = gtk::Button::with_label("Перезапустить");
-    btn_restart.set_tooltip_text(Some("Перезапустить службу womic-mic"));
+    btn_restart.set_tooltip_text(Some("Перезапустить службу RustMIC"));
     btn_restart.connect_clicked(|_| restart_service());
     actions.attach(&btn_restart, 0, 0, 1, 1);
 
@@ -628,12 +783,14 @@ fn build_ui(app: &Application) -> Rc<Ui> {
 
     let ui = Rc::new(Ui {
         window,
+        status_link_label,
         status_phone,
         status_client,
         status_service,
         level,
         sw_mic,
         sw_default,
+        music_now,
         guard,
     });
 
@@ -669,12 +826,12 @@ pub fn run() {
         service: service_active(),
         phone: phone_connected(),
         client: client_running(),
-        default_mic: default_is_womic(),
+        default_mic: default_is_rustmic(),
     };
     let handle = match tray.spawn() {
         Ok(handle) => Some(handle),
         Err(error) => {
-            eprintln!("womic-mic-gui: tray unavailable: {error}");
+            eprintln!("RustMIC-gui: tray unavailable: {error}");
             None
         }
     };
@@ -684,9 +841,9 @@ pub fn run() {
     thread::spawn(move || loop {
         let state = State {
             service: service_active(),
-            phone: usb_phone(),
+            phone: link_info(&settings()),
             client: client_running(),
-            default_mic: default_is_womic(),
+            default_mic: default_is_rustmic(),
         };
         if poll_tx.send(state).is_err() {
             return;
@@ -697,7 +854,7 @@ pub fn run() {
     spawn_level_meter(level_tx);
 
     let app = Application::builder()
-        .application_id("io.github.womic.WomicMic")
+        .application_id("io.github.OlegVapnik.RustMIC")
         .build();
 
     let ui_cell: Rc<RefCell<Option<Rc<Ui>>>> = Rc::new(RefCell::new(None));
@@ -749,12 +906,12 @@ pub fn run() {
                         match save(&next) {
                             Ok(()) => restart_service(),
                             Err(error) => {
-                                eprintln!("womic-mic-gui: cannot save settings: {error}")
+                                eprintln!("RustMIC-gui: cannot save settings: {error}")
                             }
                         }
                     }
                     Cmd::ToggleDefault => {
-                        set_default(!default_is_womic());
+                        set_default(!default_is_rustmic());
                     }
                     Cmd::Restart => restart_service(),
                     Cmd::Test => test_mic(),
@@ -774,6 +931,10 @@ pub fn run() {
             smooth.set(next);
             if let Some(ui) = ui_for_tick.borrow().as_ref() {
                 ui.level.set_fraction((next * 3.0).min(1.0) as f64);
+                let playing = rustmic_mic::music::now_playing()
+                    .map(|query| format!("играет: {query}"))
+                    .unwrap_or_else(|| "ничего не играет".to_string());
+                ui.music_now.set_text(&playing);
             }
 
             // state refresh
@@ -783,8 +944,10 @@ pub fn run() {
             }
             if let Some(state) = latest {
                 if let Some(ui) = ui_for_tick.borrow().as_ref() {
+                    let cfg = settings();
+                    ui.status_link_label.set_text(link_label(&cfg));
                     ui.status_phone.set_text(match &state.phone {
-                        Some(model) => model,
+                        Some(info) => info,
                         None => "не найден",
                     });
                     ui.status_client

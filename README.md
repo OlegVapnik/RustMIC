@@ -1,156 +1,175 @@
-# womic-mic
+# RustMIC
 
-Телефон на Android как системный микрофон — на Linux и на Windows, по USB (adb),
-с шумодавом RNNoise. Одна программа вместо скрипта: сама держит всю цепочку и
-перезапускает её при сбоях. Один и тот же исходник собирается под обе системы.
-
-Linux:
-
-```
-rustmic (USB/adb, Opus -> PCM s16le 48k mono)
-   -> RNNoise (nnnoiseless, in-process)
-   -> pacat -> womic_sink (null sink)
-   -> module-remap-source -> источник womic_mic
-```
-
-Windows:
+Телефон на Android как системный микрофон — на Linux и Windows. Без кабеля
+(Wi‑Fi / Wi‑Fi Direct / Bluetooth) или по USB (adb), с шумодавом RNNoise.
+Одна программа вместо набора скриптов: сама держит цепочку, перезапускает её при
+сбоях и умеет **пускать музыку сразу в микрофон** — без скачивания файлов.
 
 ```
-rustmic.exe (USB/adb, Opus -> PCM s16le 48k mono)
-   -> RNNoise (nnnoiseless, in-process)
-   -> WASAPI (cpal) -> "CABLE Input" (VB-CABLE)
-   -> приложения видят "CABLE Output" как микрофон
+телефон (WO Mic) --rustmic--> Opus → PCM s16le 48k mono
+                              -> RNNoise (nnnoiseless, в процессе)
+                              -> виртуальный микрофон системы
+                              -> Discord / Zoom / OBS / игра
 ```
+
+Дополнительно: `RustMIC play "название или ссылка"` запускает mpv с
+YouTube / YouTube Music / SoundCloud и смешивает звук в тот же виртуальный
+микрофон. На Linux вы его одновременно слышите в наушниках.
+
+## Возможности
+
+- **Транспорт без кабеля**: `wifi` (IP телефона), `wifi-direct`, `bluetooth`
+  (MAC-адрес) — `adb` не нужен вообще.
+- **USB** через `adb`: классический режим WO Mic.
+- **Шумодав** RNNoise + мягкий VAD-гейт, громкость 0–150 %.
+- **Музыка в микрофон**: name → `ytsearch1:<name>`, ссылки Passing-through.
+- **Linux**: PipeWire null-sink → `module-remap-source` → `rustmic_mic`.
+- **Windows**: WASAPI → VB-CABLE, приложения выбирают **CABLE Output**.
+- **Один файл на Windows**: `RustMIC-portable.exe` распаковывается,
+  один раз запрашивает UAC для VB-CABLE и дальше работает без установки.
+
+## Windows: один файл
+
+Скачайте `RustMIC-portable.exe`, запустите двойным щелчком:
+
+1. Программа распакует всё в `%LOCALAPPDATA%\RustMIC`.
+2. Если VB-CABLE не найден — один раз появится UAC-запрос на
+   `VBCABLE_Setup_x64.exe`. Повторных запросов не будет.
+3. Откроется окно RustMIC. Выберите **Подключение → Wi-Fi** и введите IP
+   телефона из приложения WO Mic (или USB / Bluetooth).
+4. В приложениях (Discord, Zoom, OBS…) выберите микрофон **CABLE Output**.
+
+В комплекте: `RustMIC.exe`, `RustMIC-gui.exe`, `RustMIC-client.exe`
+(клиент протокола WO Mic), `mpv.exe`, `yt-dlp.exe`, `VBCABLE_Setup_x64.exe`.
+Ничего докачивать и копировать вручную не нужно.
+
+> VB-CABLE — сторонний драйвер. Это единственный способ получить виртуальный
+> микрофон в Windows без подписи kernel-драйвера; установка происходит один раз
+> и требуется только при первом запуске.
+
+## Настройка Wi-Fi (без кабеля)
+
+1. В WO Mic на телефоне: **Settings → Transport → Wi-Fi** (или Wi-Fi Direct).
+2. Запомните IP, показанный на экране телефона (например `192.168.1.50`).
+3. В RustMIC откройте настройки: **Подключение → wifi**, поле **Хост** = IP.
+   Для Bluetooth выберите `bluetooth` и введите MAC.
+4. Перезапустите службу кнопкой «Перезапустить» (или `RustMIC restart`).
+
+То же из консоли:
+
+```fish
+RustMIC run --transport wifi --host 192.168.1.50
+RustMIC run --transport wifi-direct --host 192.168.49.1
+RustMIC run --transport bluetooth --bt-address AA:BB:CC:DD:EE:FF
+RustMIC run --transport usb          # старый режим, нужен adb
+```
+
+Телефон и компьютер должны быть в одной сети. WO Mic слушает TCP-порт 7800;
+мешать могут файрволл и мобильный режим — проверьте `RustMIC status`.
+
+## Музыка в микрофон
+
+```fish
+RustMIC play "Harvest Moon"                       # поиск YouTube
+RustMIC play "https://youtu.be/dQw4w9WgXcQ"       # прямая ссылка
+RustMIC play "https://soundcloud.com/foo/bar"
+RustMIC now-playing
+RustMIC stop-music
+```
+
+То же есть в GUI: поле со ссылкой/названием, кнопки «Играть» и «Стоп».
+Ссылки YouTube Music / SoundCloud передаются mpv как есть; обычные имена
+превращаются в `ytsearch1:<name>`, то есть поиск и стриминг делает mpv + yt-dlp
+на лету. Файл скачивать вручную не надо (mpv буферизует поток).
+
+На Linux звук идёт в отдельный `rustmic_music` null-sink и двумя лупбеками
+смешивается в `rustmic_sink` (микрофон) и в обычный выход (наушники).
+Лупбеки снимаются командой `stop-music`, чтобы не было эха.
+
+Ограничения: DRM-защищённые треки из браузера не перехватываются — здесь
+воспроизводится поток, а не экран. Задержка ≈20–40 мс. Наушники обязательны,
+иначе микрофон подхватит звук из колонок. В Discord/OBS выключите Krisp/шумодав,
+иначе он может вырезать музыку как «фоновый шум».
 
 ## Linux: сборка и установка
 
 ```fish
-cd ~/Projects/womic-mic
+cd ~/Projects/RustMIC
 cargo build --release --features gui
-install -m 0755 target/release/womic-mic ~/.local/bin/womic-mic
-install -m 0755 target/release/womic-mic-gui ~/.local/bin/womic-mic-gui
-womic-mic install          # пишет systemd-юнит, включает и запускает
+install -m 0755 target/release/RustMIC ~/.local/bin/RustMIC
+install -m 0755 target/release/RustMIC-gui ~/.local/bin/RustMIC-gui
+RustMIC install          # systemd-юнит, enable --now
 ```
 
-Зависимости: `rustmic` в `PATH` (клиент WO Mic), `pacat`/`parec`/`pactl` (PipeWire),
-`adb` (по умолчанию `~/Android/Sdk/platform-tools/adb`), телефон с включённой
-отладкой по USB и приложением WO Mic.
+Зависимости: `rustmic` в `PATH` (клиент WO Mic), `pacat`/`parec`/`pactl`
+(PipeWire), `mpv`, `yt-dlp`, `adb` (только для USB). GUI — GTK4 + ksni.
 
-## Windows: сборка и установка
+## Windows: сборка одного файла
 
-Нужны Rust (MSVC toolchain: rustup + Visual Studio Build Tools с «Desktop
-development with C++»), [VB-CABLE](https://vb-audio.com/Cable/) и `rustmic.exe`
-в `PATH` (клиент WO Mic, собранный под Windows). `adb.exe` берётся из
-`%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe`, либо укажите свой путь
-флагом `--adb` / в конфиге.
+Кросс-сборка с Linux (нужны цели `x86_64-pc-windows-gnu` и `rust-lld` +
+библиотеки MinGW; подробности в `tools/windows-portable/`):
 
-```powershell
-cargo build --release --features gui
-.\target\release\womic-mic.exe run --stats   # проверить в консоли
-.\target\release\womic-mic.exe install       # автозапуск (ключ Run) + старт
-.\target\release\womic-mic-gui.exe           # окно-дашборд
+```fish
+cd ~/Projects/RustMIC
+./tools/windows-portable/build-portable.sh
+# результат: tools/windows-portable/RustMIC-portable.exe
 ```
 
-GUI под Windows — на egui (без GTK): статус телефона и службы, включение
-микрофона, шумодав, гейт, громкость, выбор выходного устройства (по умолчанию
-`CABLE Input`), диагностика, журнал. Закрытие окна завершает GUI; фоновый
-супервизор продолжает работать, пока его не остановят.
-
-После запуска выберите в приложениях (Discord, Zoom, OBS…) микрофон
-**«CABLE Output»** — Windows сам на виртуальный кабель не переключает.
-
-Готовые exe также собираются в GitHub Actions (артефакты `womic-mic-windows`).
-`set-default` / `unset-default` — только для Linux.
+`fetch-payloads.sh` тянет бинарники, `pack.py` добавляет контейнер к
+launcher'у. Сборка на самой Windows: `cargo build --release --features gui`,
+затем те же шаги `fetch-payloads.sh` + `pack.py` (или Tasks в GUI).
 
 ## Команды
 
 | команда | что делает |
 |---|---|
-| `womic-mic run` | запустить супервизор (на Linux это же вызывает systemd) |
-| `womic-mic status` | состояние цепочки, узлов/устройств, adb и источника |
-| `womic-mic settings` | показать настройки и пути конфига/журнала |
-| `womic-mic filter` | stdin → stdout, только шумодав (для тестов/других пайплайнов) |
-| `womic-mic install` | Linux: systemd-юнит `enable --now`; Windows: ключ автозапуска + старт |
-| `womic-mic install-no-enable` | создать без автозапуска |
-| `womic-mic uninstall` | остановить и удалить автозапуск |
-| `womic-mic start` / `stop` / `restart` | управление фоновым процессом |
-| `womic-mic set-default` / `unset-default` | переключить микрофон по умолчанию (Linux) |
+| `RustMIC run` | супервизор (на Linux им управляет systemd) |
+| `RustMIC status` | состояние цепочки, устройства, телефона, клиента |
+| `RustMIC settings` | текущие настройки и пути |
+| `RustMIC play <query\|URL>` | включить трек/ссылку в микрофон |
+| `RustMIC stop-music` | остановить музыку и снять лупбеки |
+| `RustMIC now-playing` | что играет сейчас |
+| `RustMIC filter` | stdin → stdout, только шумодав |
+| `RustMIC install` / `uninstall` | автозапуск (systemd / Run key) |
+| `RustMIC start` / `stop` / `restart` | управление фоновым процессом |
+| `RustMIC set-default` / `unset-default` | микрофон по умолчанию (Linux) |
 
-Флаги: `--adb PATH`, `--device NAME` (устройство вывода, Windows),
-`--gate 0.0..1.0` (дополнительный гейт по VAD от RNNoise), `--no-denoise`,
-`--stats` (печатать in/out RMS и VAD раз в 0.5 с).
+Флаги `run`: `--transport usb|wifi|wifi-direct|bluetooth`, `--host IP`,
+`--bt-address MAC`, `--adb PATH`, `--device NAME` (Windows), `--gate 0.0..1.0`,
+`--no-denoise`, `--stats`.
 
-## GUI и трей
+## Настройки
 
-`womic-mic-gui` — на Linux окно-дашборд GTK4 плюс иконка в системном трее
-(StatusNotifierItem, хост — noctalia), на Windows — окно egui.
-
-- статус: телефон (USB), сервис, индикатор уровня с затуханием;
-- микрофон включён (старт/стоп), микрофон по умолчанию и шумодав (Linux);
-- гейт; громкость виртуального микрофона 0–150 %;
-- выбор устройства вывода (Windows);
-- диагностика проверяет зависимости, аудиосервер/устройства, узлы и последние
-  строки журнала;
-- на Linux закрытие окна не завершает программу — она остаётся в трее;
-- автозапуск на Linux: `spawn-at-startup "womic-mic-gui"` в конфиге niri
-  (`~/.config/niri-noctalia/cfg/autostart.kdl` — именно это дерево читает niri,
-  путь задан в `NIRI_CONFIG`).
-
-Настройки:
-
-- Linux: `~/.config/womic-mic/config.toml`
-- Windows: `%APPDATA%\womic-mic\config.toml`
+- Linux: `~/.config/RustMIC/config.toml`
+- Windows: `%APPDATA%\RustMIC\config.toml`
 
 ```toml
+transport = "wifi"          # usb | wifi | wifi-direct | bluetooth
+host = "192.168.1.50"       # только для Wi-Fi
+bt_address = ""             # только для Bluetooth
 denoise = true
 gate = 0.00
 volume = 100
-device = "CABLE Input"   # только Windows
+device = "CABLE Input"      # только Windows
 ```
 
-Демон перечитывает шумодав, гейт и громкость при изменении файла; на Linux
-громкость применяется при создании узла и периодически восстанавливается после
-перезапуска PipeWire. Поэтому служба запускается без аргументов.
-
-## Что делает супервизор
-
-- перезапускает `rustmic` и аудиовыход при падении (backoff 1→30 с, сброс после
-  60 с стабильной работы);
-- на Linux раз в 3 с проверяет узлы PipeWire и пересоздаёт `womic_sink`/`womic_mic`,
-  если их снесли (например, рестарт PipeWire);
-- держит `parec` на мониторе sink, чтобы виртуальный sink не уходил в suspend
-  и `pacat` не блокировался;
-- проверяет `adb devices` и ждёт телефон, если он отключён;
-- корректно завершается по SIGTERM/SIGINT (Linux) или `taskkill` (Windows),
-  убирает pid-файл.
-
-Журнал: Linux — `journalctl --user -u womic-mic`, Windows —
-`%LOCALAPPDATA%\womic-mic\womic-mic.log` (кнопка «Журнал» в GUI).
+Демон перечитывает шумодав, гейт и громкость «на горячую»; смену транспорта
+GUI применяет перезапуском службы.
 
 ## Шумодав
 
-RNNoise (порт `nnnoiseless`, чистый Rust). Работает кадрами по 480 сэмплов (10 мс).
-Замеры на синтетике: розовый шум — подавление −21…−30 dB; сигнал с голосом —
-VAD 0.98–1.00, речь проходит, шум убирается. Тихая комната на выходе даёт почти ноль.
+RNNoise (порт `nnnoiseless`, чистый Rust), кадры по 480 сэмплов (10 мс).
+Розовый шум подавляется на −21…−30 dB, речь проходит. `--gate N` добавляет
+мягкий гейт по VAD (по умолчанию выключен).
 
-`--gate N` добавляет мягкий гейт: при VAD ниже N сигнал плавно уводится в тишину
-(по умолчанию выключен, RNNoise сам справляется).
-
-## Проверка
-
-Linux:
+## Диагностика
 
 ```fish
-womic-mic status
-systemctl --user status womic-mic
-journalctl --user -u womic-mic -f
-womic-mic run --stats
+RustMIC status
+RustMIC settings
+journalctl --user -u RustMIC -f        # Linux
 ```
 
-Windows:
-
-```powershell
-.\target\release\womic-mic.exe status
-.\target\release\womic-mic.exe restart
-Get-Content "$env:LOCALAPPDATA\womic-mic\womic-mic.log" -Tail 40 -Wait
-```
+Windows: `%LOCALAPPDATA%\RustMIC\RustMIC.log`, кнопка «Диагностика» в GUI.
+Клиент протокола — открытый `rustmic` (github.com/sambukuper/rustmic); бренд
+и код RustMIC не имеют отношения к WO Mic / Wolicheng Tech.

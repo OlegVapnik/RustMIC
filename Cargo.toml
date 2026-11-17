@@ -1,11 +1,11 @@
 [package]
-name = "womic-mic"
+name = "RustMIC"
 version = "0.2.0"
 edition = "2021"
 description = "WO Mic (Android) as a system microphone on Linux and Windows, with RNNoise denoise"
 
 [lib]
-name = "womic_mic"
+name = "rustmic_mic"
 path = "src/lib.rs"
 
 [features]
@@ -13,11 +13,11 @@ default = []
 gui = ["dep:gtk4", "dep:ksni", "dep:eframe"]
 
 [[bin]]
-name = "womic-mic"
+name = "RustMIC"
 path = "src/main.rs"
 
 [[bin]]
-name = "womic-mic-gui"
+name = "RustMIC-gui"
 path = "src/bin/gui.rs"
 
 [target.'cfg(unix)'.dependencies]

@@ -127,10 +127,10 @@ pub fn install(enable: bool) -> Result<(), String> {
         println!("autostart registered: {SERVICE} = {value}");
         println!("settings: {}", config::settings_path().display());
         start()?;
-        println!("started womic-mic in the background");
+        println!("started RustMIC in the background");
     } else {
         println!("autostart not registered (install-no-enable)");
-        println!("start it with: womic-mic.exe run");
+        println!("start it with: RustMIC.exe run");
     }
     Ok(())
 }
@@ -162,7 +162,12 @@ pub fn open_settings_folder() {
 }
 
 pub fn rustmic_running() -> bool {
-    tasklist(&["/FI", "IMAGENAME eq rustmic.exe", "/NH"]).contains("rustmic")
+    let client = config::client_program();
+    let image = PathBuf::from(&client)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "RustMIC-client.exe".to_string());
+    tasklist(&["/FI", &format!("IMAGENAME eq {image}"), "/NH"]).contains(&image)
 }
 
 pub fn log_tail(lines: usize) -> String {
@@ -198,16 +203,21 @@ pub fn status_text(settings: &Settings) -> String {
                 .to_string()
         })
     ));
-    text.push_str(&format!(
-        "phone (adb): {}\n",
-        match adb::usb_phone(&settings.adb) {
-            Some(phone) => match phone.model {
-                Some(model) => format!("connected ({model})"),
-                None => "connected".to_string(),
-            },
-            None => "not connected".to_string(),
-        }
-    ));
+    let phone = match settings.transport.as_str() {
+        "wifi" | "wifi-direct" => format!("телефон (Wi-Fi): {}", settings.host),
+        "bluetooth" => format!("телефон (Bluetooth): {}", settings.bt_address),
+        _ => format!(
+            "телефон (USB): {}",
+            match adb::usb_phone(&settings.adb) {
+                Some(phone) => match phone.model {
+                    Some(model) => format!("подключён ({model})"),
+                    None => "подключён".to_string(),
+                },
+                None => "не подключён".to_string(),
+            }
+        ),
+    };
+    text.push_str(&format!("{phone}\n"));
     text.push_str(&format!(
         "client: {}\n",
         if rustmic_running() {
@@ -229,10 +239,11 @@ pub fn status_text(settings: &Settings) -> String {
 }
 
 pub fn diagnostics(settings: &Settings) -> String {
-    let mut text = String::from("womic-mic diagnostics (windows)\n");
+    let mut text = String::from("RustMIC diagnostics (windows)\n");
     text.push_str("--- dependencies ---\n");
+    let client = config::client_program();
     for (name, command) in [
-        ("rustmic", "rustmic"),
+        ("client", client.as_str()),
         ("adb", settings.adb.as_str()),
     ] {
         text.push_str(&format!(

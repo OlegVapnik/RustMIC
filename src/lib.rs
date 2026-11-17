@@ -1,8 +1,8 @@
-//! womic-mic — WO Mic (Android) as a system microphone.
+//! RustMIC — WO Mic (Android) as a system microphone.
 //!
 //! One binary, two platforms:
 //!
-//! * Linux:  rustmic -> RNNoise -> pacat -> womic_sink -> remap -> womic_mic
+//! * Linux:  rustmic -> RNNoise -> pacat -> rustmic_sink -> remap -> rustmic_mic
 //! * Windows: rustmic -> RNNoise -> WASAPI playback to a virtual audio cable
 //!   (VB-CABLE and friends), which apps then see as a recording device.
 //!
@@ -15,6 +15,7 @@ pub mod config;
 pub mod denoise;
 pub mod level;
 pub mod logging;
+pub mod music;
 pub mod platform;
 
 use std::sync::atomic::AtomicBool;

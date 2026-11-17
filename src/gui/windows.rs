@@ -10,8 +10,51 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use womic_mic::config::Settings;
-use womic_mic::{audio, level, platform};
+use rustmic_mic::config::{self, Settings};
+use rustmic_mic::{audio, level, platform};
+
+fn link_info(settings: &Settings) -> Option<String> {
+    match settings.transport.as_str() {
+        "wifi" | "wifi-direct" => {
+            if settings.host.trim().is_empty() {
+                None
+            } else {
+                Some(settings.host.clone())
+            }
+        }
+        "bluetooth" => {
+            if settings.bt_address.trim().is_empty() {
+                None
+            } else {
+                Some(settings.bt_address.clone())
+            }
+        }
+        _ => rustmic_mic::adb::usb_phone(&settings.adb)
+            .map(|phone| phone.model.unwrap_or_else(|| "телефон".to_string())),
+    }
+}
+
+fn link_label(transport: &str) -> &'static str {
+    match transport {
+        "wifi" => "Телефон (Wi-Fi)",
+        "wifi-direct" => "Телефон (Wi-Fi Direct)",
+        "bluetooth" => "Телефон (Bluetooth)",
+        _ => "Телефон (USB)",
+    }
+}
+
+fn run_cli(args: &[&str]) {
+    let exe = config::program_dir().join("RustMIC.exe");
+    let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    thread::spawn(move || {
+        let _ = rustmic_mic::command(&exe)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
+}
 
 #[derive(Clone, Default)]
 struct Status {
@@ -31,19 +74,19 @@ struct App {
     diagnostics: Option<String>,
     notice: Option<String>,
     busy: bool,
+    music_query: String,
+    music_now: String,
 }
 
 impl App {
     fn new() -> Self {
         let settings = Settings::load();
         let (tx, rx) = channel();
-        let adb = settings.adb.clone();
+        let poll_settings = settings.clone();
         let device = settings.device.clone();
         thread::spawn(move || loop {
-            let phone = womic_mic::adb::usb_phone(&adb).map(|phone| {
-                phone.model.unwrap_or_else(|| "телефон".to_string())
-            });
-            let capture = womic_mic::audio::windows::input_names()
+            let phone = link_info(&poll_settings);
+            let capture = rustmic_mic::audio::windows::input_names()
                 .into_iter()
                 .find(|name| name.to_lowercase().contains("cable output"));
             let status = Status {
@@ -52,7 +95,7 @@ impl App {
                 client: platform::rustmic_running(),
                 backend: audio::windows::device_present(&device),
                 capture,
-                adb: adb.clone(),
+                adb: poll_settings.adb.clone(),
             };
             if tx.send(status).is_err() {
                 return;
@@ -67,6 +110,8 @@ impl App {
             diagnostics: None,
             notice: None,
             busy: false,
+            music_query: String::new(),
+            music_now: "ничего не играет".into(),
         }
     }
 
@@ -82,8 +127,13 @@ impl App {
             .num_columns(2)
             .spacing([18.0, 6.0])
             .show(ui, |ui| {
-                ui.label("Телефон (USB)");
-                ui.label(self.status.phone.clone().unwrap_or_else(|| "не найден".into()));
+                ui.label(link_label(&self.settings.transport));
+                ui.label(
+                    self.status
+                        .phone
+                        .clone()
+                        .unwrap_or_else(|| "не найден".into()),
+                );
                 ui.end_row();
                 ui.label("Поток");
                 ui.label(if self.status.client { "идёт" } else { "нет" });
@@ -171,6 +221,9 @@ impl eframe::App for App {
             }
             self.status = status;
         }
+        self.music_now = rustmic_mic::music::now_playing()
+            .map(|query| format!("играет: {query}"))
+            .unwrap_or_else(|| "ничего не играет".to_string());
         let rms = level::read();
         self.smooth = if rms > self.smooth {
             rms
@@ -179,7 +232,7 @@ impl eframe::App for App {
         };
 
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
-            ui.heading("WO Mic");
+            ui.heading("RustMIC");
             ui.label("Телефон Android как микрофон Windows");
             ui.separator();
 
@@ -220,6 +273,46 @@ impl eframe::App for App {
             {
                 self.save();
             }
+            let mut link_changed = false;
+            egui::ComboBox::from_label("Подключение")
+                .selected_text(link_label(&self.settings.transport))
+                .show_ui(ui, |ui| {
+                    for transport in config::TRANSPORTS {
+                        if ui
+                            .selectable_value(
+                                &mut self.settings.transport,
+                                transport.to_string(),
+                                *transport,
+                            )
+                            .clicked()
+                        {
+                            link_changed = true;
+                        }
+                    }
+                });
+            if self.settings.transport == "wifi" || self.settings.transport == "wifi-direct" {
+                ui.horizontal(|ui| {
+                    ui.label("Хост (IP телефона)");
+                    if ui.text_edit_singleline(&mut self.settings.host).changed() {
+                        self.save();
+                    }
+                });
+            } else if self.settings.transport == "bluetooth" {
+                ui.horizontal(|ui| {
+                    ui.label("Bluetooth MAC");
+                    if ui
+                        .text_edit_singleline(&mut self.settings.bt_address)
+                        .changed()
+                    {
+                        self.save();
+                    }
+                });
+            }
+            if link_changed {
+                self.save();
+                self.busy = true;
+                thread::spawn(platform::restart);
+            }
             ui.horizontal(|ui| {
                 ui.label("Выходное устройство");
                 if ui
@@ -241,6 +334,28 @@ impl eframe::App for App {
                 ui.colored_label(egui::Color32::LIGHT_RED, notice);
             }
             ui.separator();
+            ui.heading("Музыка в микрофон");
+            ui.label(
+                egui::RichText::new(
+                    "Название или ссылка YouTube / SoundCloud — играет сразу в микрофон, скачивать файл не надо.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.music_query);
+                if ui.button("Играть").clicked() {
+                    let query = self.music_query.clone();
+                    if !query.trim().is_empty() {
+                        run_cli(&["play", &query]);
+                    }
+                }
+                if ui.button("Стоп").clicked() {
+                    run_cli(&["stop-music"]);
+                }
+            });
+            ui.label(&self.music_now);
+            ui.separator();
             self.ui_actions(ui);
             ui.separator();
             ui.label(
@@ -257,14 +372,14 @@ pub fn run() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([520.0, 640.0])
             .with_min_inner_size([420.0, 520.0])
-            .with_title("WO Mic"),
+            .with_title("RustMIC"),
         ..Default::default()
     };
     if let Err(error) = eframe::run_native(
-        "WO Mic",
+        "RustMIC",
         options,
         Box::new(|_cc| Ok(Box::new(App::new()))),
     ) {
-        eprintln!("womic-mic-gui: {error}");
+        eprintln!("RustMIC-gui: {error}");
     }
 }

@@ -1,2 +1,5 @@
 /target
 /.opencode
+/tools/windows-portable/target
+/tools/windows-portable/payload
+/tools/windows-portable/RustMIC-portable.exe

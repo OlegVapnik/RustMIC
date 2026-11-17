@@ -1,9 +1,9 @@
-//! womic-mic — WO Mic (Android) as a system microphone.
+//! RustMIC — WO Mic (Android) as a system microphone.
 //!
 //! Pipeline:  rustmic (adb/USB transport, Opus -> PCM s16le 48k mono)
 //!            -> RNNoise denoise (nnnoiseless)
 //!            -> platform sink:
-//!               Linux   pacat -> womic_sink -> (remap) -> source womic_mic
+//!               Linux   pacat -> rustmic_sink -> (remap) -> source rustmic_mic
 //!               Windows WASAPI -> virtual cable -> capture side in apps
 //!
 //! The supervisor restarts every stage on failure, re-checks adb and recreates
@@ -20,10 +20,10 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use womic_mic::audio::{self, Sink};
-use womic_mic::config::{self, Settings};
-use womic_mic::denoise::{Denoiser, Live};
-use womic_mic::{adb, level, logging, platform, STOP};
+use rustmic_mic::audio::{self, Sink};
+use rustmic_mic::config::{self, Settings};
+use rustmic_mic::denoise::{Denoiser, Live};
+use rustmic_mic::{adb, level, logging, music, platform, STOP};
 
 fn install_signals() {
     #[cfg(unix)]
@@ -116,19 +116,50 @@ fn pump(
 
 // ---------------------------------------------------------------- session
 
+/// Build the `rustmic` client arguments for the configured transport.
+/// Wi-Fi and Bluetooth need no cable and no adb at all.
+fn rustmic_args(cfg: &Settings) -> Result<Vec<String>, String> {
+    let mut args = vec!["--transport".to_string(), cfg.transport.clone()];
+    match cfg.transport.as_str() {
+        "usb" => {
+            args.extend(["--adb".to_string(), cfg.adb.clone()]);
+        }
+        "wifi" | "wifi-direct" => {
+            if cfg.host.trim().is_empty() {
+                return Err("Wi-Fi transport needs host = <phone IP> in config.toml".into());
+            }
+            args.extend(["--host".to_string(), cfg.host.clone()]);
+        }
+        "bluetooth" => {
+            if cfg.bt_address.trim().is_empty() {
+                return Err("bluetooth transport needs bt_address = <AA:BB:...>".into());
+            }
+            args.extend(["--bt-address".to_string(), cfg.bt_address.clone()]);
+        }
+        other => return Err(format!("unknown transport: {other}")),
+    }
+    // `--reconnect` defaults to 3 retries in rustmic 0.1.x; no need to pass it.
+    args.push("--stdout".to_string());
+    Ok(args)
+}
+
 fn session(cfg: &Settings, live: &Arc<RwLock<Live>>, stats: bool) -> Result<(), String> {
-    adb::forward(&cfg.adb);
+    let args = rustmic_args(cfg)?;
+    if cfg.transport == "usb" {
+        adb::forward(&cfg.adb);
+    }
 
     let mut sink = audio::open(cfg, live)?;
     log(&format!("sink: {}", sink.describe()));
 
-    let mut mic = womic_mic::command("rustmic")
-        .args(["--transport", "usb", "--adb", &cfg.adb, "--stdout"])
+    let client = config::client_program();
+    let mut mic = rustmic_mic::command(&client)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|error| format!("cannot start rustmic: {error}"))?;
+        .map_err(|error| format!("cannot start {client}: {error}"))?;
 
     let mut den = Denoiser::new(live.clone());
     den.stats = stats;
@@ -149,8 +180,8 @@ fn run(cfg: Settings, stats: bool) -> i32 {
     let _ = fs::create_dir_all(config::cache_dir());
     audio::prepare();
     log(&format!(
-        "starting (adb={}, device={}, denoise={}, gate={}, volume={})",
-        cfg.adb, cfg.device, cfg.denoise, cfg.gate, cfg.volume
+        "starting (transport={}, host={}, adb={}, device={}, denoise={}, gate={}, volume={})",
+        cfg.transport, cfg.host, cfg.adb, cfg.device, cfg.denoise, cfg.gate, cfg.volume
     ));
 
     let pidfile = config::pid_path();
@@ -194,7 +225,9 @@ fn run(cfg: Settings, stats: bool) -> i32 {
     let mut last_devices_check = Instant::now() - Duration::from_secs(60);
 
     while !STOP.load(Ordering::SeqCst) {
-        if last_devices_check.elapsed() >= Duration::from_secs(3) {
+        // Only USB needs adb. Wi-Fi / Bluetooth are handled by rustmic's own
+        // reconnect loop, so the supervisor never blocks on a missing cable.
+        if cfg.transport == "usb" && last_devices_check.elapsed() >= Duration::from_secs(3) {
             last_devices_check = Instant::now();
             if !adb::phone_ready(&cfg.adb) {
                 log("phone not connected over adb, waiting");
@@ -270,11 +303,34 @@ fn main() {
     let cmd = args.first().map(String::as_str).unwrap_or("run");
     let rest = if args.is_empty() { &args[..] } else { &args[1..] };
 
+    // The whole remainder is the query for `play` (quotes are already joined
+    // into one argument by the shell).
+    let play_query = if cmd == "play" { rest.join(" ") } else { String::new() };
+
     let mut cfg = Settings::load();
     let mut stats = false;
     let mut it = rest.iter().peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--transport" => {
+                if let Some(value) = it.next() {
+                    cfg.transport = config::normalize_transport(value);
+                }
+            }
+            "--host" => {
+                if let Some(value) = it.next() {
+                    cfg.host = value.clone();
+                    if cfg.transport == "usb" {
+                        cfg.transport = "wifi".to_string();
+                    }
+                }
+            }
+            "--bt-address" => {
+                if let Some(value) = it.next() {
+                    cfg.bt_address = value.clone();
+                    cfg.transport = "bluetooth".to_string();
+                }
+            }
             "--adb" => {
                 if let Some(value) = it.next() {
                     cfg.adb = value.clone();
@@ -295,6 +351,19 @@ fn main() {
             other if other.starts_with("--gate=") => {
                 cfg.gate = other[7..].parse().unwrap_or(0.0);
             }
+            other if other.starts_with("--transport=") => {
+                cfg.transport = config::normalize_transport(&other[12..]);
+            }
+            other if other.starts_with("--host=") => {
+                cfg.host = other[7..].to_string();
+                if cfg.transport == "usb" {
+                    cfg.transport = "wifi".to_string();
+                }
+            }
+            other if other.starts_with("--bt-address=") => {
+                cfg.bt_address = other[13..].to_string();
+                cfg.transport = "bluetooth".to_string();
+            }
             other if other.starts_with("--adb=") => cfg.adb = other[6..].to_string(),
             other if other.starts_with("--device=") => cfg.device = other[9..].to_string(),
             _ => {}
@@ -312,6 +381,12 @@ fn main() {
             }
         }
         "settings" => {
+            println!("transport: {}", cfg.transport);
+            if cfg.transport == "wifi" || cfg.transport == "wifi-direct" {
+                println!("host: {}", cfg.host);
+            } else if cfg.transport == "bluetooth" {
+                println!("bt-address: {}", cfg.bt_address);
+            }
             println!("denoise: {}", cfg.denoise);
             println!("gate: {}", cfg.gate);
             println!("volume: {}%", cfg.volume);
@@ -323,6 +398,27 @@ fn main() {
             println!("log: {}", config::log_path().display());
             0
         }
+        "play" => match music::play(&cfg, &play_query) {
+            Ok(message) => {
+                println!("{message}");
+                0
+            }
+            Err(error) => {
+                log(&error);
+                1
+            }
+        },
+        "stop-music" => report(music::stop()),
+        "now-playing" => match music::now_playing() {
+            Some(query) => {
+                println!("{query}");
+                0
+            }
+            None => {
+                println!("ничего не играет");
+                1
+            }
+        },
         "filter" => filter(&cfg, stats),
         "install" => report(platform::install(true)),
         "install-no-enable" => report(platform::install(false)),
@@ -352,18 +448,24 @@ fn main() {
         },
         "-h" | "--help" | "help" => {
             println!(
-                "womic-mic {}\n\
+                "RustMIC {}\n\
                  \n\
                  usage:\n\
-                 \x20 womic-mic run [--adb PATH] [--device NAME] [--gate 0.0..1.0] [--no-denoise] [--stats]\n\
-                 \x20 womic-mic status | settings\n\
-                 \x20 womic-mic filter [--gate N] [--no-denoise]   (stdin -> stdout, for testing)\n\
-                 \x20 womic-mic install | install-no-enable | uninstall\n\
-                 \x20 womic-mic start | stop | restart\n\
-                 \x20 womic-mic set-default | unset-default   (Linux only)\n\
+                 \x20 RustMIC run [--transport usb|wifi|wifi-direct|bluetooth] [--host IP] [--bt-address MAC]\n\
+                 \x20             [--adb PATH] [--device NAME] [--gate 0.0..1.0] [--no-denoise] [--stats]\n\
+                 \x20 RustMIC status | settings\n\
+                 \x20 RustMIC play <название или URL>   (песня сразу в микрофон, без скачивания)\n\
+                 \x20 RustMIC stop-music | now-playing\n\
+                 \x20 RustMIC filter [--gate N] [--no-denoise]   (stdin -> stdout, для проверки)\n\
+                 \x20 RustMIC install | install-no-enable | uninstall\n\
+                 \x20 RustMIC start | stop | restart\n\
+                 \x20 RustMIC set-default | unset-default   (только Linux)\n\
                  \n\
-                 Linux:   rustmic --stdout | rnnoise | pacat -> womic_sink -> womic_mic\n\
-                 Windows: rustmic --stdout | rnnoise | WASAPI -> virtual cable (VB-CABLE)",
+                 Без кабеля: включите WO Mic на телефоне -> Wi-Fi -> IP телефона,\n\
+                 \x20 RustMIC run --transport wifi --host 192.168.1.50\n\
+                 \n\
+                 Linux:   rustmic --stdout | rnnoise | pacat -> rustmic_sink -> rustmic_mic\n\
+                 Windows: rustmic --stdout | rnnoise | WASAPI -> виртуальный кабель (VB-CABLE)",
                 env!("CARGO_PKG_VERSION")
             );
             0

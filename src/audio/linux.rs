@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::Sink;
-use crate::config::{Settings, SINK, SRC};
+use crate::config::{Settings, MUSIC_SINK, SINK, SRC};
 use crate::{logging, STOP};
 
 fn pactl(args: &[&str]) -> bool {
@@ -48,9 +48,9 @@ pub fn ensure_devices() {
             "load-module",
             "module-null-sink",
             &format!("sink_name={SINK}"),
-            "sink_properties=device.description=WO_Mic_Sink",
+            "sink_properties=device.description=RustMIC_Phone",
         ]) {
-            logging::log("created null sink womic_sink");
+            logging::log("created null sink rustmic_sink");
         }
     }
     if !node_exists("sources", SRC) {
@@ -59,9 +59,21 @@ pub fn ensure_devices() {
             "module-remap-source",
             &format!("master={SINK}.monitor"),
             &format!("source_name={SRC}"),
-            "source_properties=device.description=WO_Mic_Phone",
+            "source_properties=device.description=RustMIC_Microphone",
         ]) {
-            logging::log("created remap source womic_mic");
+            logging::log("created remap source rustmic_mic");
+        }
+    }
+    // Separate sink for `RustMIC play`: keeps the level meter/mic path clean
+    // and lets us mirror the music to speakers only while it is playing.
+    if !node_exists("sinks", MUSIC_SINK) {
+        if pactl(&[
+            "load-module",
+            "module-null-sink",
+            &format!("sink_name={MUSIC_SINK}"),
+            "sink_properties=device.description=RustMIC_Music",
+        ]) {
+            logging::log("created null sink rustmic_music");
         }
     }
     pactl(&["set-sink-volume", SINK, "100%"]);
@@ -75,7 +87,7 @@ pub fn set_source_volume(percent: u32) -> bool {
     pactl(&["set-source-volume", SRC, &format!("{percent}%")])
 }
 
-pub fn default_is_womic() -> bool {
+pub fn default_is_rustmic() -> bool {
     pactl_out(&["get-default-source"]).trim() == SRC
 }
 

@@ -10,7 +10,7 @@ use crate::config;
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 pub fn log(msg: &str) {
-    eprintln!("womic-mic: {msg}");
+    eprintln!("RustMIC: {msg}");
     write_file(msg);
 }
 

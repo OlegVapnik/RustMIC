@@ -1,4 +1,4 @@
-//! womic-mic-gui — platform dispatcher.
+//! RustMIC-gui — platform dispatcher.
 //!
 //! Linux:   GTK4 window + StatusNotifier tray (feature `gui`).
 //! Windows: egui window (feature `gui`).
@@ -21,6 +21,6 @@ fn main() {
 
 #[cfg(not(feature = "gui"))]
 fn main() {
-    eprintln!("womic-mic-gui: build with --features gui");
+    eprintln!("RustMIC-gui: build with --features gui");
     std::process::exit(1);
 }
