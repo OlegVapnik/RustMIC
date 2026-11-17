@@ -256,9 +256,8 @@ impl eframe::App for App {
             }
             if ui
                 .add(
-                    egui::Slider::new(&mut self.settings.gate, 0.0..=1.0)
-                        .text("Гейт")
-                        .fixed_decimals(2),
+                    egui::Slider::new(&mut self.settings.gate_voice, 0..=100)
+                        .text("Гейт, %"),
                 )
                 .changed()
             {
@@ -266,7 +265,7 @@ impl eframe::App for App {
             }
             if ui
                 .add(
-                    egui::Slider::new(&mut self.settings.volume, 0..=150)
+                    egui::Slider::new(&mut self.settings.mic_volume, 0..=100)
                         .text("Громкость, %"),
                 )
                 .changed()

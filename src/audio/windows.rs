@@ -127,7 +127,7 @@ impl Sink for CpalSink {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, error));
         }
         if let Ok(live) = self.live.read() {
-            self.state.set_gain(live.volume as f32 / 100.0);
+            self.state.set_gain(live.mic_volume as f32 / 100.0);
         }
         let mut queue = self.state.queue();
         for &sample in samples {

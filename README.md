@@ -21,7 +21,7 @@ YouTube / YouTube Music / SoundCloud и смешивает звук в тот ж
 - **Транспорт без кабеля**: `wifi` (IP телефона), `wifi-direct`, `bluetooth`
   (MAC-адрес) — `adb` не нужен вообще.
 - **USB** через `adb`: классический режим WO Mic.
-- **Шумодав** RNNoise + мягкий VAD-гейт, громкость 0–150 %.
+- **Шумодав** RNNoise + гейт по VAD или по уровню (RMS, дБ), громкость 0–100 %.
 - **Музыка в микрофон**: name → `ytsearch1:<name>`, ссылки Passing-through.
 - **Linux**: PipeWire null-sink → `module-remap-source` → `rustmic_mic`.
 - **Windows**: WASAPI → VB-CABLE, приложения выбирают **CABLE Output**.
@@ -126,6 +126,10 @@ launcher'у. Сборка на самой Windows: `cargo build --release --feat
 | `RustMIC run` | супервизор (на Linux им управляет systemd) |
 | `RustMIC status` | состояние цепочки, устройства, телефона, клиента |
 | `RustMIC settings` | текущие настройки и пути |
+| `RustMIC ctl state` | состояние демона по локальному сокету (JSON) |
+| `RustMIC ctl mic 80` | громкость микрофона на лету |
+| `RustMIC ctl gate-mode voice\|level` | режим гейта |
+| `RustMIC ctl mute` / `unmute` | быстрое выключение микрофона |
 | `RustMIC play <query\|URL>` | включить трек/ссылку в микрофон |
 | `RustMIC stop-music` | остановить музыку и снять лупбеки |
 | `RustMIC now-playing` | что играет сейчас |
@@ -135,8 +139,14 @@ launcher'у. Сборка на самой Windows: `cargo build --release --feat
 | `RustMIC set-default` / `unset-default` | микрофон по умолчанию (Linux) |
 
 Флаги `run`: `--transport usb|wifi|wifi-direct|bluetooth`, `--host IP`,
-`--bt-address MAC`, `--adb PATH`, `--device NAME` (Windows), `--gate 0.0..1.0`,
-`--no-denoise`, `--stats`.
+`--bt-address MAC`, `--adb PATH`, `--device NAME` (Windows),
+`--gate-mode voice|level`, `--gate-voice 0..100`, `--gate-level -60..0`,
+`--mic-volume 0..100`, `--music-volume 0..100`, `--loudnorm`, `--no-ducking`,
+`--no-monitor`, `--no-denoise`, `--stats`.
+
+Демон и GUI общаются по локальному сокету (`$XDG_RUNTIME_DIR/RustMIC.sock`,
+на Windows — именованный pipe). Формат — JSON Lines с версией протокола;
+`RustMIC ctl` — маленький клиент для того же протокола.
 
 ## Настройки
 
@@ -148,19 +158,29 @@ transport = "wifi"          # usb | wifi | wifi-direct | bluetooth
 host = "192.168.1.50"       # только для Wi-Fi
 bt_address = ""             # только для Bluetooth
 denoise = true
-gate = 0.00
-volume = 100
+gate_mode = "voice"         # voice | level
+gate_voice = 0              # 0..100 %, 0 = выключен
+gate_level_db = -45.0       # -60..0 dBFS, 0 = выключен
+mic_volume = 100
+music_volume = 100
+loudnorm = false
+ducking = true
+ducking_db = 12.0
+monitor_music = true
 device = "CABLE Input"      # только Windows
 ```
 
-Демон перечитывает шумодав, гейт и громкость «на горячую»; смену транспорта
-GUI применяет перезапуском службы.
+Файл версионирован: старые `gate = 0.46` и `volume = 78` автоматически
+превращаются в `gate_voice = 46` и `mic_volume = 78`. Демон перечитывает
+шумодав, гейт и громкости «на горячую»; смену транспорта GUI применяет
+перезапуском службы.
 
 ## Шумодав
 
 RNNoise (порт `nnnoiseless`, чистый Rust), кадры по 480 сэмплов (10 мс).
-Розовый шум подавляется на −21…−30 dB, речь проходит. `--gate N` добавляет
-мягкий гейт по VAD (по умолчанию выключен).
+Розовый шум подавляется на −21…−30 dB, речь проходит. Гейт работает в двух
+режимах: `voice` — вероятность голоса RNNoise (0–100 %, по умолчанию
+выключен), `level` — RMS в dBFS с гистерезисом 3 дБ.
 
 ## Диагностика
 

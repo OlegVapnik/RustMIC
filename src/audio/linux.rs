@@ -78,7 +78,7 @@ pub fn ensure_devices() {
     }
     pactl(&["set-sink-volume", SINK, "100%"]);
     pactl(&["set-sink-mute", SINK, "0"]);
-    let volume = crate::config::Settings::load().volume;
+    let volume = crate::config::Settings::load().mic_volume;
     pactl(&["set-source-volume", SRC, &format!("{volume}%")]);
     pactl(&["set-source-mute", SRC, "0"]);
 }

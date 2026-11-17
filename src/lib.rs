@@ -12,7 +12,9 @@
 pub mod adb;
 pub mod audio;
 pub mod config;
+pub mod core;
 pub mod denoise;
+pub mod ipc;
 pub mod level;
 pub mod logging;
 pub mod music;

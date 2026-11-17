@@ -33,11 +33,11 @@ fn save(settings: &Settings) -> std::io::Result<()> {
     settings.save()
 }
 
-fn fmt_gate(value: f32) -> String {
-    if value <= 0.005 {
+fn fmt_gate(value: u32) -> String {
+    if value == 0 {
         "выкл".into()
     } else {
-        format!("{value:.2}")
+        format!("{value}%")
     }
 }
 
@@ -568,13 +568,13 @@ fn build_ui(app: &Application) -> Rc<Ui> {
     }
     cfg_box.append(&row("Шумодав (RNNoise)", &sw_denoise));
 
-    let scale_gate = Scale::with_range(Orientation::Horizontal, 0.0, 1.0, 0.05);
-    scale_gate.set_value(current.gate as f64);
+    let scale_gate = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+    scale_gate.set_value(current.gate_voice as f64);
     scale_gate.set_draw_value(false);
     scale_gate.set_hexpand(true);
     scale_gate.set_size_request(160, -1);
 
-    let gate_value = Label::new(Some(&fmt_gate(current.gate)));
+    let gate_value = Label::new(Some(&fmt_gate(current.gate_voice)));
     gate_value.set_width_chars(5);
     gate_value.set_xalign(1.0);
     gate_value.add_css_class("dim-label");
@@ -587,10 +587,10 @@ fn build_ui(app: &Application) -> Rc<Ui> {
         let value_label = gate_value.clone();
         let notice = settings_notice.clone();
         scale_gate.connect_value_changed(move |scale| {
-            let value = scale.value() as f32;
+            let value = scale.value().round().clamp(0.0, 100.0) as u32;
             value_label.set_text(&fmt_gate(value));
             let mut next = settings();
-            next.gate = value;
+            next.gate_voice = value;
             if let Err(error) = save(&next) {
                 notice.set_text(&format!("Не удалось сохранить настройки: {error}"));
                 notice.set_visible(true);
@@ -632,8 +632,8 @@ fn build_ui(app: &Application) -> Rc<Ui> {
     volume_box.set_margin_bottom(10);
     volume_box.set_margin_start(12);
     volume_box.set_margin_end(12);
-    let volume = current.volume;
-    let volume_scale = Scale::with_range(Orientation::Horizontal, 0.0, 150.0, 1.0);
+    let volume = current.mic_volume;
+    let volume_scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
     volume_scale.set_value(volume as f64);
     volume_scale.set_draw_value(false);
     volume_scale.set_hexpand(true);
@@ -646,10 +646,10 @@ fn build_ui(app: &Application) -> Rc<Ui> {
         let armed = Rc::new(Cell::new(false));
         let slider = volume_scale.clone();
         volume_scale.connect_value_changed(move |scale| {
-            let value = scale.value().round().clamp(0.0, 150.0) as u32;
+            let value = scale.value().round().clamp(0.0, 100.0) as u32;
             label.set_text(&format!("{value}%"));
             let mut next = settings();
-            next.volume = value;
+            next.mic_volume = value;
             if let Err(error) = save(&next) {
                 label.set_tooltip_text(Some(&format!("Не удалось сохранить: {error}")));
                 notice.set_text(&format!("Не удалось сохранить настройки: {error}"));
@@ -668,7 +668,7 @@ fn build_ui(app: &Application) -> Rc<Ui> {
             let slider = slider.clone();
             glib::timeout_add_local_once(Duration::from_millis(180), move || {
                 armed.set(false);
-                let value = slider.value().round().clamp(0.0, 150.0) as u32;
+                let value = slider.value().round().clamp(0.0, 100.0) as u32;
                 if audio::linux::set_source_volume(value) {
                     label.set_tooltip_text(None);
                     notice.set_visible(false);

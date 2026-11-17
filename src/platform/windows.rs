@@ -226,7 +226,7 @@ pub fn status_text(settings: &Settings) -> String {
             "stopped"
         }
     ));
-    text.push_str(&format!("configured volume: {}%\n", settings.volume));
+    text.push_str(&format!("configured volume: {}%\n", settings.mic_volume));
     text.push_str(&format!(
         "autostart: {}\n",
         if autostart_installed() {

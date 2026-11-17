@@ -216,7 +216,7 @@ pub fn status_text(settings: &Settings) -> String {
             "absent"
         }
     ));
-    text.push_str(&format!("configured source volume: {}%\n", settings.volume));
+    text.push_str(&format!("configured source volume: {}%\n", settings.mic_volume));
     text.push_str(&format!("default source: {}\n", linux::default_source()));
     let phone = match settings.transport.as_str() {
         "wifi" | "wifi-direct" => format!("телефон (Wi-Fi): {}", settings.host),
