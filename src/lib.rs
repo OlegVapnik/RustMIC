@@ -14,6 +14,8 @@ pub mod audio;
 pub mod config;
 pub mod core;
 pub mod denoise;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod ipc;
 pub mod level;
 pub mod logging;

@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-gui = ["dep:gtk4", "dep:ksni", "dep:eframe"]
+gui = ["dep:ksni", "dep:eframe", "dep:tray-icon"]
 
 [[bin]]
 name = "RustMIC"
@@ -22,12 +22,13 @@ path = "src/bin/gui.rs"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-gtk4 = { version = "0.11", optional = true }
 ksni = { version = "0.3", features = ["blocking"], optional = true }
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.18"
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"], optional = true }
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow"], optional = true }
+tray-icon = { version = "0.21", optional = true }
 
 [dependencies]
 ctrlc = "3.4"

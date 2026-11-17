@@ -1,22 +1,11 @@
-//! RustMIC-gui — platform dispatcher.
-//!
-//! Linux:   GTK4 window + StatusNotifier tray (feature `gui`).
-//! Windows: egui window (feature `gui`).
+//! RustMIC-gui — the shared egui window for Linux and Windows.
 
 // The Windows build is a GUI app: no console window should flash on start.
 #![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
 
-#[cfg(all(feature = "gui", unix))]
-#[path = "../gui/linux.rs"]
-mod imp;
-
-#[cfg(all(feature = "gui", windows))]
-#[path = "../gui/windows.rs"]
-mod imp;
-
 #[cfg(feature = "gui")]
 fn main() {
-    imp::run();
+    rustmic_mic::gui::run();
 }
 
 #[cfg(not(feature = "gui"))]
