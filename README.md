@@ -189,7 +189,7 @@ launcher'у. Сборка на самой Windows: `cargo build --release --feat
 - Windows: `%APPDATA%\RustMIC\config.toml`
 
 ```toml
-config_version = 5
+config_version = 6
 transport = "wifi"          # usb | wifi | wifi-direct | bluetooth
 host = "192.168.1.50"       # только для Wi-Fi
 bt_address = ""             # только для Bluetooth
@@ -198,7 +198,8 @@ gate_mode = "voice"         # voice | level
 gate_voice = 0              # 0..100 %, 0 = выключен
 gate_level_db = -45.0       # -60..0 dBFS, 0 = выключен
 mic_volume = 100
-music_volume = 100
+music_volume = 100          # громкость трека в виртуальном микрофоне
+monitor_volume = 100        # громкость трека у себя в колонках (Linux)
 loudnorm = false
 ducking = true
 ducking_db = 12.0
@@ -206,7 +207,7 @@ monitor_music = true
 device = "CABLE Input"      # только Windows
 ```
 
-Файл версионирован (сейчас `config_version = 5`): старые `gate = 0.46` и
+Файл версионирован (сейчас `config_version = 6`): старые `gate = 0.46` и
 `volume = 78` автоматически превращаются в `gate_voice = 46` и
 `mic_volume = 78`. Неизвестные ключи (в том числе от удалённых функций)
 игнорируются и исчезают при следующем сохранении. Демон перечитывает
