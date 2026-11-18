@@ -43,38 +43,38 @@ pub fn nodes_present() -> bool {
 /// Idempotently make sure the virtual sink + remapped source exist and apply
 /// the configured volumes.
 pub fn ensure_devices() {
-    if !node_exists("sinks", SINK) {
-        if pactl(&[
+    if !node_exists("sinks", SINK)
+        && pactl(&[
             "load-module",
             "module-null-sink",
             &format!("sink_name={SINK}"),
             "sink_properties=device.description=RustMIC_Phone",
-        ]) {
-            logging::log("created null sink rustmic_sink");
-        }
+        ])
+    {
+        logging::log("created null sink rustmic_sink");
     }
-    if !node_exists("sources", SRC) {
-        if pactl(&[
+    if !node_exists("sources", SRC)
+        && pactl(&[
             "load-module",
             "module-remap-source",
             &format!("master={SINK}.monitor"),
             &format!("source_name={SRC}"),
             "source_properties=device.description=RustMIC_Microphone",
-        ]) {
-            logging::log("created remap source rustmic_mic");
-        }
+        ])
+    {
+        logging::log("created remap source rustmic_mic");
     }
     // Separate sink for `RustMIC play`: keeps the level meter/mic path clean
     // and lets us mirror the music to speakers only while it is playing.
-    if !node_exists("sinks", MUSIC_SINK) {
-        if pactl(&[
+    if !node_exists("sinks", MUSIC_SINK)
+        && pactl(&[
             "load-module",
             "module-null-sink",
             &format!("sink_name={MUSIC_SINK}"),
             "sink_properties=device.description=RustMIC_Music",
-        ]) {
-            logging::log("created null sink rustmic_music");
-        }
+        ])
+    {
+        logging::log("created null sink rustmic_music");
     }
     pactl(&["set-sink-volume", SINK, "100%"]);
     pactl(&["set-sink-mute", SINK, "0"]);

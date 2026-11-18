@@ -29,8 +29,6 @@ eframe = { version = "0.37", default-features = false, features = ["clipboard", 
 cpal = "0.18"
 eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow"], optional = true }
 tray-icon = { version = "0.21", optional = true }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
-widestring = "1.2"
 
 [dependencies]
 ctrlc = "3.4"

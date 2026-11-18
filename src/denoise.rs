@@ -152,8 +152,8 @@ impl Denoiser {
 
             if self.stats {
                 let mut input = 0.0f64;
-                for i in 0..FRAME {
-                    input += (self.fin[i] as f64).powi(2);
+                for sample in self.fin.iter().take(FRAME) {
+                    input += (*sample as f64).powi(2);
                 }
                 self.acc_out += (sum / FRAME as f64).sqrt();
                 self.acc_vad += vad as f64;

@@ -36,7 +36,6 @@ use serde_json::{json, Value};
 use crate::config::SINK;
 use crate::config::{self, GateMode, Settings, MUSIC_SINK};
 use crate::core::TrackState;
-use crate::mixer;
 use crate::{command, logging};
 
 fn cache(name: &str) -> PathBuf {
@@ -237,6 +236,7 @@ fn playing() -> bool {
 #[derive(Clone)]
 struct Runtime {
     music_volume: u32,
+    monitor_volume: u32,
     ducking: bool,
     ducking_db: f32,
     loudnorm: bool,
@@ -250,6 +250,7 @@ impl From<&Settings> for Runtime {
     fn from(settings: &Settings) -> Self {
         Self {
             music_volume: settings.music_volume,
+            monitor_volume: settings.monitor_volume,
             ducking: settings.ducking,
             ducking_db: settings.ducking_db,
             loudnorm: settings.loudnorm,
@@ -280,6 +281,7 @@ pub fn configure(settings: &Settings) {
         #[cfg(unix)]
         set_monitor(next.monitor_music);
     }
+    apply_monitor_volume(next.monitor_volume);
 }
 
 /// Start the background tick that applies music volume / VAD ducking.
@@ -310,12 +312,9 @@ fn gate_is_active(current: &Runtime) -> bool {
     }
 }
 
-/// Music is ducked while the microphone gate is open, and also while the
-/// external translator is speaking. The latter is independent of gate mode so
-/// ducking still works when VAD is disabled.
-fn effective_volume(current: &Runtime, gate_open: bool, translate_active: bool) -> u32 {
-    let duck = current.ducking
-        && ((gate_is_active(current) && gate_open) || translate_active);
+/// Music is ducked while the microphone gate is open.
+fn effective_volume(current: &Runtime, gate_open: bool) -> u32 {
+    let duck = current.ducking && gate_is_active(current) && gate_open;
     if duck {
         let factor = 10f32.powf(-current.ducking_db / 20.0);
         (current.music_volume as f32 * factor).round() as u32
@@ -327,8 +326,7 @@ fn effective_volume(current: &Runtime, gate_open: bool, translate_active: bool) 
 fn apply_volume() {
     let current = runtime().read().map(|r| r.clone()).unwrap_or_else(|e| e.into_inner().clone());
     let gate_open = crate::level::read_meter().gate_open;
-    let translate_active = mixer::status().active;
-    let value = effective_volume(&current, gate_open, translate_active);
+    let value = effective_volume(&current, gate_open);
     let _ = mpv_request(&json!(["set_property", "volume", value]));
 }
 
@@ -445,7 +443,7 @@ fn cover_from(value: &Value) -> Option<String> {
     thumbnails
         .iter()
         .filter_map(|item| item.get("url").and_then(Value::as_str))
-        .last()
+        .next_back()
         .map(str::to_string)
 }
 
@@ -547,11 +545,14 @@ pub fn status() -> Option<TrackState> {
 
 /// Load one monitor loopback and remember its module index.
 #[cfg(unix)]
-fn load_loopback(source: &str, sink: &str, latency: &str, path: PathBuf) {
+fn load_loopback(source: &str, sink: &str, latency: &str, path: PathBuf, name: Option<&str>) {
     let spec = format!("source={source} sink={sink} latency_msec={latency}");
-    let output = Command::new("pactl")
-        .args(["load-module", "module-loopback", &spec])
-        .output();
+    let mut args = vec!["load-module", "module-loopback", spec.as_str()];
+    let property = name.map(|name| format!("sink_input_properties=media.name={name}"));
+    if let Some(property) = property.as_deref() {
+        args.push(property);
+    }
+    let output = Command::new("pactl").args(&args).output();
     if let Ok(output) = output {
         let index = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !index.is_empty() {
@@ -599,7 +600,54 @@ fn set_monitor(on: bool) {
         "@DEFAULT_SINK@",
         "30",
         monitor_path(),
+        Some(MONITOR_NAME),
     );
+    let volume = runtime()
+        .read()
+        .map(|current| current.monitor_volume)
+        .unwrap_or(100);
+    apply_monitor_volume(volume);
+}
+
+/// Media name of the speaker loopback, so its gain can be changed without
+/// touching the music that goes into the virtual microphone.
+#[cfg(unix)]
+// No spaces: pactl splits module arguments on whitespace, so a space would
+// truncate media.name to its first word.
+const MONITOR_NAME: &str = "RustMIC-monitor";
+
+/// Set the gain of the speaker monitor loopback (0..100 %).
+///
+/// PipeWire/PulseAudio exposes the loopback as a sink-input; the volume is
+/// applied there so `music_volume` (the stream) stays untouched.
+#[cfg(unix)]
+fn apply_monitor_volume(volume: u32) {
+    if !monitor_path().exists() {
+        return;
+    }
+    let Ok(output) = Command::new("pactl")
+        .args(["list", "sink-inputs"])
+        .output()
+    else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let needle = format!("media.name = \"{MONITOR_NAME}\"");
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(index) = line.strip_prefix("Sink Input #") {
+            current = Some(index.trim().to_string());
+        } else if line == needle {
+            if let Some(index) = current.clone() {
+                let _ = Command::new("pactl")
+                    .args(["set-sink-input-volume", &index, &format!("{volume}%")])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -609,12 +657,21 @@ fn link(on: bool, monitor: bool) {
         return;
     }
     crate::audio::linux::ensure_devices();
-    load_loopback(&format!("{MUSIC_SINK}.monitor"), SINK, "25", loopback_path());
+    load_loopback(
+        &format!("{MUSIC_SINK}.monitor"),
+        SINK,
+        "25",
+        loopback_path(),
+        None,
+    );
     set_monitor(monitor);
 }
 
 #[cfg(windows)]
 fn unload_loopbacks() {}
+
+#[cfg(windows)]
+fn apply_monitor_volume(_volume: u32) {}
 #[cfg(windows)]
 fn link(_on: bool, _monitor: bool) {}
 
@@ -805,9 +862,10 @@ mod tests {
     }
 
     #[test]
-    fn ducking_follows_gate_and_translation() {
+    fn ducking_follows_gate() {
         let mut rt = Runtime {
             music_volume: 100,
+            monitor_volume: 100,
             ducking: true,
             ducking_db: 12.0,
             loudnorm: false,
@@ -816,14 +874,13 @@ mod tests {
             gate_voice: 40,
             gate_level_db: -45.0,
         };
-        assert!(effective_volume(&rt, true, false) < 100);
-        assert_eq!(effective_volume(&rt, false, false), 100);
-        assert!(effective_volume(&rt, false, true) < 100);
+        assert!(effective_volume(&rt, true) < 100);
+        assert_eq!(effective_volume(&rt, false), 100);
         rt.gate_voice = 0;
-        assert_eq!(effective_volume(&rt, true, false), 100);
-        assert!(effective_volume(&rt, true, true) < 100);
+        assert_eq!(effective_volume(&rt, true), 100);
         rt.ducking = false;
-        assert_eq!(effective_volume(&rt, true, true), 100);
+        rt.gate_voice = 40;
+        assert_eq!(effective_volume(&rt, true), 100);
     }
 
     #[test]

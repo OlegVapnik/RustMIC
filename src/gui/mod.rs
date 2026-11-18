@@ -5,8 +5,8 @@
 //! running it shows an explicit "служба не запущена" screen with a start button
 //! instead of quietly falling back to stale files.
 //!
-//! One window, four tabs: microphone, soundpad, translation, settings. The
-//! Linux build adds a StatusNotifier tray; Windows uses its own tray module.
+//! One window, three tabs: microphone, soundpad and settings. The Linux build
+//! adds a StatusNotifier tray; Windows uses its own tray module.
 
 #[cfg(unix)]
 #[path = "tray_linux.rs"]
@@ -24,13 +24,9 @@ use eframe::egui::{
     RichText, Sense, Stroke, TextStyle, Theme, ThemePreference, Vec2,
 };
 
-use crate::config::{
-    self, AsrEngine, EnginePreset, GateMode, MtEngine, Settings, TranslateMode,
-    TtsEngine,
-};
-use crate::core::{AppState, Levels};
-use crate::engines::EngineProbe;
-use crate::{audio, engines, ipc, platform};
+use crate::config::{self, GateMode, Settings};
+use crate::core::{AppState, Levels, Tile};
+use crate::{audio, ipc, platform};
 
 use tray::{TrayCommand, TrayHandle, TrayStatus};
 
@@ -64,11 +60,10 @@ fn small(text: impl Into<String>) -> RichText {
 // ---------------------------------------------------------------- events
 
 enum UiEvent {
-    State(AppState),
+    State(Box<AppState>),
     Offline(String),
     DefaultMic(bool),
     Diagnostics(String),
-    Probe(EngineProbe),
     Notice(String),
 }
 
@@ -76,7 +71,6 @@ enum UiEvent {
 enum Tab {
     Mic,
     Pad,
-    Translate,
     Settings,
 }
 
@@ -106,13 +100,10 @@ struct App {
     last_frame: Instant,
     audio_edit_until: Instant,
     music_query: String,
-    tile_title: String,
-    tile_query: String,
     diagnostics: Option<String>,
-    engine_probe: EngineProbe,
-    probe_busy: bool,
     notice: Option<(String, Instant)>,
     busy_since: Option<Instant>,
+    settings_dirty: bool,
     hidden: bool,
     quitting: bool,
 }
@@ -139,7 +130,6 @@ impl App {
         spawn_state_reader(event_tx.clone());
         spawn_command_worker(command_rx, event_tx.clone());
         spawn_system_poller(event_tx.clone());
-        spawn_probe_worker(event_tx.clone());
 
         let (tray_tx, tray_commands) = channel::<TrayCommand>();
         let tray = match tray::spawn(tray_tx) {
@@ -169,13 +159,10 @@ impl App {
             last_frame: Instant::now(),
             audio_edit_until: Instant::now(),
             music_query: String::new(),
-            tile_title: String::new(),
-            tile_query: String::new(),
             diagnostics: None,
-            engine_probe: EngineProbe::default(),
-            probe_busy: true,
             notice: None,
             busy_since: None,
+            settings_dirty: false,
             hidden: false,
             quitting: false,
         }
@@ -248,24 +235,6 @@ impl App {
         });
     }
 
-    fn save_engines(&mut self) {
-        let s = &self.settings;
-        let command = crate::core::Command::SetEngines {
-            preset: s.engine_preset,
-            asr: s.asr_engine,
-            mt: s.mt_engine,
-            tts: s.tts_engine,
-            groq_key: s.groq_api_key.clone(),
-            groq_model: s.groq_model.clone(),
-            openai_base: s.openai_base_url.clone(),
-            openai_key: s.openai_api_key.clone(),
-            openai_model: s.openai_model.clone(),
-            voice_sample: s.voice_sample.clone(),
-        };
-        self.send(command);
-        self.notify("Настройки движков сохранены".into());
-    }
-
     fn play(&mut self, query: String) {
         if query.trim().is_empty() {
             return;
@@ -284,14 +253,12 @@ impl App {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 UiEvent::State(next) => {
+                    let mut next = *next;
                     let editing = Instant::now() < self.audio_edit_until;
-                    self.state = if editing {
-                        let mut next = next;
+                    if editing {
                         next.audio = self.state.audio.clone();
-                        next
-                    } else {
-                        next
-                    };
+                    }
+                    self.state = next;
                     self.online = true;
                     self.offline_error = None;
                     self.busy_since = None;
@@ -307,10 +274,6 @@ impl App {
                 }
                 UiEvent::DefaultMic(value) => self.default_mic = value,
                 UiEvent::Diagnostics(text) => self.diagnostics = Some(text),
-                UiEvent::Probe(result) => {
-                    self.probe_busy = false;
-                    self.engine_probe = result;
-                }
                 UiEvent::Notice(text) => self.notify(text),
             }
         }
@@ -462,7 +425,6 @@ impl App {
                     for (tab, label) in [
                         (Tab::Mic, "Микрофон"),
                         (Tab::Pad, "Саундпад"),
-                        (Tab::Translate, "Перевод"),
                         (Tab::Settings, "Настройки"),
                     ] {
                         let selected = self.tab == tab;
@@ -488,52 +450,45 @@ impl App {
         }
 
         card(ui, "Соединение", |ui| {
-            egui::Grid::new("connection")
-                .num_columns(2)
-                .spacing([22.0, 8.0])
-                .show(ui, |ui| {
-                    kv(ui, "Канал", transport_label(&self.state.connection.transport));
-                    kv(
-                        ui,
-                        "Телефон",
-                        if self.state.connection.phone.is_empty() {
-                            "—"
-                        } else {
-                            &self.state.connection.phone
-                        },
-                    );
-                    kv(
-                        ui,
-                        "Поток",
-                        if self.state.connection.client_running {
-                            "идёт"
-                        } else if !self.service_running() {
-                            "служба остановлена"
-                        } else {
-                            "нет"
-                        },
-                    );
-                    kv(
-                        ui,
-                        "Виртуальный микрофон",
-                        if self.state.connection.sink_present && self.state.connection.source_present
-                        {
-                            "готов"
-                        } else {
-                            "не найден"
-                        },
-                    );
-                    kv(
-                        ui,
-                        "Задержка",
-                        &self
-                            .state
-                            .connection
-                            .latency_ms
-                            .map(|ms| format!("{ms} мс"))
-                            .unwrap_or_else(|| "—".into()),
-                    );
+            let connection = self.state.connection.clone();
+            let (title, state_text, state_color) = connection_summary(&connection);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).size(16.0).family(semibold()).color(TEXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    status_pill(ui, state_text, state_color);
                 });
+            });
+            ui.add_space(8.0);
+            dot_row(
+                ui,
+                "Поток",
+                if connection.client_running {
+                    "идёт"
+                } else if !self.service_running() {
+                    "служба остановлена"
+                } else {
+                    "нет"
+                },
+                if connection.client_running { GREEN } else { AMBER },
+            );
+            dot_row(
+                ui,
+                "Виртуальный микрофон",
+                if connection.sink_present && connection.source_present {
+                    "готов"
+                } else {
+                    "не найден"
+                },
+                if connection.sink_present && connection.source_present {
+                    GREEN
+                } else {
+                    RED
+                },
+            );
+            if !connection.phone_connected {
+                ui.add_space(4.0);
+                ui.label(small("Проверьте кабель, Wi-Fi или Bluetooth и запустите WO Mic на телефоне."));
+            }
         });
 
         ui.add_space(12.0);
@@ -571,13 +526,30 @@ impl App {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let muted = self.state.audio.muted;
-                let label = if muted { "Включить микрофон" } else { "Выключить звук" };
-                if ui.button(label).clicked() {
+                let button = if muted {
+                    egui::Button::new(RichText::new("Заглушить микрофон").color(RED))
+                        .fill(Color32::from_rgb(55, 23, 27))
+                        .stroke(Stroke::new(1.0, RED))
+                } else {
+                    egui::Button::new("Заглушить микрофон")
+                };
+                if ui
+                    .add(button)
+                    .on_hover_text(if muted {
+                        "Микрофон заглушён — нажмите, чтобы включить"
+                    } else {
+                        "Нажмите, чтобы заглушить микрофон"
+                    })
+                    .clicked()
+                {
                     let muted = !muted;
                     self.state.audio.muted = muted;
                     let _ = self
                         .commands
                         .send(crate::core::Command::SetMuted { muted });
+                }
+                if muted {
+                    ui.label(RichText::new("заглушён").size(12.0).color(RED));
                 }
                 if ui.button("Тест микрофона").clicked() {
                     platform::test_mic();
@@ -598,11 +570,13 @@ impl App {
         ui.add_space(12.0);
         card(ui, "Обработка", |ui| {
             let mut denoise = self.state.audio.denoise;
-            if ui
-                .checkbox(&mut denoise, "Шумодав RNNoise")
-                .on_hover_text("Убирает постоянный шум до гейта")
-                .changed()
-            {
+            if toggle_row(
+                ui,
+                "Шумодав RNNoise",
+                &mut denoise,
+                true,
+                "Убирает постоянный шум до гейта",
+            ) {
                 self.state.audio.denoise = denoise;
                 self.audio_edit_until = Instant::now() + Duration::from_millis(700);
                 self.send(crate::core::Command::SetDenoise { enabled: denoise });
@@ -610,15 +584,20 @@ impl App {
 
             ui.add_space(8.0);
             let mut mode = self.state.audio.gate_mode;
-            egui::ComboBox::from_label("Гейт")
-                .selected_text(match mode {
-                    GateMode::Voice => "по голосу (VAD)",
-                    GateMode::Level => "по уровню (dBFS)",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut mode, GateMode::Voice, "по голосу (VAD)");
-                    ui.selectable_value(&mut mode, GateMode::Level, "по уровню (dBFS)");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Режим гейта").size(13.0).color(TEXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("gate-mode")
+                        .selected_text(match mode {
+                            GateMode::Voice => "по голосу (VAD)",
+                            GateMode::Level => "по уровню (dBFS)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut mode, GateMode::Voice, "по голосу (VAD)");
+                            ui.selectable_value(&mut mode, GateMode::Level, "по уровню (dBFS)");
+                        });
                 });
+            });
             if mode != self.state.audio.gate_mode {
                 self.state.audio.gate_mode = mode;
                 self.settings.gate_mode = mode;
@@ -631,43 +610,32 @@ impl App {
             ui.add_space(6.0);
             match self.state.audio.gate_mode {
                 GateMode::Voice => {
-                    let mut gate = self.state.audio.gate_voice;
-                    let response = ui.add(
-                        egui::Slider::new(&mut gate, 0..=100)
-                            .text("чувствительность VAD, %")
-                            .suffix("%"),
-                    );
-                    if response.changed() {
+                    let mut gate = self.state.audio.gate_voice as f32;
+                    let row = slider_row(ui, "Порог VAD", &mut gate, 0.0..=100.0, "%", 0);
+                    if row.changed {
+                        let gate = gate.round() as u32;
                         self.state.audio.gate_voice = gate;
                         self.settings.gate_voice = gate;
                         self.audio_edit_until = Instant::now() + Duration::from_millis(700);
                     }
-                    if response.drag_stopped()
-                        || (response.changed() && !ui.input(|i| i.pointer.any_down()))
-                    {
-                        let _ = self
-                            .commands
-                            .send(crate::core::Command::SetGateVoice { value: gate });
+                    if row.committed {
+                        let _ = self.commands.send(crate::core::Command::SetGateVoice {
+                            value: gate.round() as u32,
+                        });
                     }
                     ui.label(small(
-                        "0 % — гейт выключен. Порог можно тянуть прямо по полоске VAD.",
+                        "0 % — гейт выключен. Порог можно тянуть и по полоске вероятности голоса.",
                     ));
                 }
                 GateMode::Level => {
                     let mut gate = self.state.audio.gate_level_db;
-                    let response = ui.add(
-                        egui::Slider::new(&mut gate, -60.0..=0.0)
-                            .text("порог, dBFS")
-                            .suffix(" dB"),
-                    );
-                    if response.changed() {
+                    let row = slider_row(ui, "Порог", &mut gate, -60.0..=0.0, " dB", 0);
+                    if row.changed {
                         self.state.audio.gate_level_db = gate;
                         self.settings.gate_level_db = gate;
                         self.audio_edit_until = Instant::now() + Duration::from_millis(700);
                     }
-                    if response.drag_stopped()
-                        || (response.changed() && !ui.input(|i| i.pointer.any_down()))
-                    {
+                    if row.committed {
                         let _ = self
                             .commands
                             .send(crate::core::Command::SetGateLevel { value: gate });
@@ -679,23 +647,18 @@ impl App {
             }
 
             ui.add_space(10.0);
-            let mut volume = self.state.audio.mic_volume;
-            let response = ui.add(
-                egui::Slider::new(&mut volume, 0..=100)
-                    .text("громкость микрофона")
-                    .suffix("%"),
-            );
-            if response.changed() {
+            let mut volume = self.state.audio.mic_volume as f32;
+            let row = slider_row(ui, "Громкость микрофона", &mut volume, 0.0..=100.0, "%", 0);
+            if row.changed {
+                let volume = volume.round() as u32;
                 self.state.audio.mic_volume = volume;
                 self.settings.mic_volume = volume;
                 self.audio_edit_until = Instant::now() + Duration::from_millis(700);
             }
-            if response.drag_stopped()
-                || (response.changed() && !ui.input(|i| i.pointer.any_down()))
-            {
+            if row.committed {
                 let _ = self
                     .commands
-                    .send(crate::core::Command::SetMicVolume { value: volume });
+                    .send(crate::core::Command::SetMicVolume { value: volume.round() as u32 });
             }
         });
     }
@@ -766,17 +729,20 @@ impl App {
                         );
                     }
                     ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(if track.title.is_empty() {
-                                track.query.clone()
-                            } else {
-                                track.title.clone()
-                            })
-                            .size(16.0)
-                            .family(semibold())
-                            .color(TEXT),
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(if track.title.is_empty() {
+                                    track.query.clone()
+                                } else {
+                                    track.title.clone()
+                                })
+                                .size(16.0)
+                                .family(semibold())
+                                .color(TEXT),
+                            )
+                            .truncate(),
                         );
-                        ui.label(small(track.query.clone()));
+                        ui.add(egui::Label::new(small(track.query.clone())).truncate());
                     });
                 });
                 ui.add_space(8.0);
@@ -797,18 +763,48 @@ impl App {
                         }
                     )));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Стоп").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("■").size(16.0))
+                                    .min_size(Vec2::new(34.0, 30.0)),
+                            )
+                            .on_hover_text("Стоп")
+                            .clicked()
+                        {
                             let _ = self.commands.send(crate::core::Command::StopMusic);
                         }
-                        if ui.button(if track.paused { "▶" } else { "Ⅱ" }).clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("»").size(18.0))
+                                    .min_size(Vec2::new(34.0, 30.0)),
+                            )
+                            .on_hover_text("+10 секунд")
+                            .clicked()
+                        {
+                            let _ = self.commands.send(crate::core::Command::Seek { seconds: 10.0 });
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(if track.paused { "▶" } else { "Ⅱ" }).size(22.0),
+                                )
+                                .min_size(Vec2::new(44.0, 38.0)),
+                            )
+                            .on_hover_text(if track.paused { "Продолжить" } else { "Пауза" })
+                            .clicked()
+                        {
                             let _ = self.commands.send(crate::core::Command::Pause {
                                 paused: !track.paused,
                             });
                         }
-                        if ui.button("+10").clicked() {
-                            let _ = self.commands.send(crate::core::Command::Seek { seconds: 10.0 });
-                        }
-                        if ui.button("-10").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("«").size(18.0))
+                                    .min_size(Vec2::new(34.0, 30.0)),
+                            )
+                            .on_hover_text("−10 секунд")
+                            .clicked()
+                        {
                             let _ = self.commands.send(crate::core::Command::Seek { seconds: -10.0 });
                         }
                     });
@@ -816,27 +812,184 @@ impl App {
             } else {
                 ui.label(RichText::new("Ничего не играет").size(16.0).color(MUTED));
                 ui.label(small(
-                    "Вставьте ссылку YouTube / YouTube Music / SoundCloud или название трека.",
+                    "Введите ссылку YouTube / YouTube Music / SoundCloud или название трека ниже.",
                 ));
+            }
+
+            ui.add_space(10.0);
+            let mut music_volume = self.state.audio.music_volume as f32;
+            let row = slider_row(ui, "Громкость в микрофон", &mut music_volume, 0.0..=100.0, "%", 0);
+            if row.changed {
+                let volume = music_volume.round() as u32;
+                self.state.audio.music_volume = volume;
+                self.settings.music_volume = volume;
+                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
+            }
+            if row.committed {
+                let _ = self.commands.send(crate::core::Command::SetMusicVolume {
+                    value: music_volume.round() as u32,
+                });
             }
         });
 
         ui.add_space(12.0);
-        card(ui, "Запустить трек", |ui| {
+        card(ui, "Звук музыки", |ui| {
+            let mut loudnorm = self.state.audio.loudnorm;
+            if toggle_row(
+                ui,
+                "Выравнивание громкости (loudnorm)",
+                &mut loudnorm,
+                true,
+                "Подтягивает тихие и громкие треки к одному уровню",
+            ) {
+                self.state.audio.loudnorm = loudnorm;
+                self.settings.loudnorm = loudnorm;
+                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
+                let _ = self
+                    .commands
+                    .send(crate::core::Command::SetLoudnorm { enabled: loudnorm });
+            }
+
+            let mut ducking = self.state.audio.ducking;
+            if toggle_row(
+                ui,
+                "Приглушать музыку, когда гейт открыт",
+                &mut ducking,
+                true,
+                "Музыка тише, пока вы говорите",
+            ) {
+                self.state.audio.ducking = ducking;
+                self.settings.ducking = ducking;
+                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
+                let _ = self
+                    .commands
+                    .send(crate::core::Command::SetDucking { enabled: ducking });
+            }
+            if self.state.audio.ducking {
+                let mut ducking_db = self.state.audio.ducking_db;
+                let row = slider_row(ui, "Затухание", &mut ducking_db, 0.0..=30.0, " dB", 0);
+                if row.changed {
+                    self.state.audio.ducking_db = ducking_db;
+                    self.settings.ducking_db = ducking_db;
+                    self.audio_edit_until = Instant::now() + Duration::from_millis(700);
+                }
+                if row.committed {
+                    let _ = self.commands.send(crate::core::Command::SetDuckingDb {
+                        value: ducking_db,
+                    });
+                }
+            }
+
+            let mut monitor = self.state.audio.monitor_music;
+            let monitor_enabled = !cfg!(windows);
+            if toggle_row(
+                ui,
+                "Слышать музыку в колонках",
+                &mut monitor,
+                monitor_enabled,
+                "Мониторинг доступен только на Linux",
+            ) && monitor_enabled
+            {
+                self.state.audio.monitor_music = monitor;
+                self.settings.monitor_music = monitor;
+                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
+                let _ = self
+                    .commands
+                    .send(crate::core::Command::SetMonitor { enabled: monitor });
+            }
+            if monitor_enabled {
+                let mut volume = self.state.audio.monitor_volume as f32;
+                let row = slider_row(
+                    ui,
+                    "Громкость в колонках",
+                    &mut volume,
+                    0.0..=100.0,
+                    "%",
+                    0,
+                );
+                if row.changed {
+                    let volume = volume.round() as u32;
+                    self.state.audio.monitor_volume = volume;
+                    self.settings.monitor_volume = volume;
+                    self.audio_edit_until = Instant::now() + Duration::from_millis(700);
+                }
+                if row.committed {
+                    let _ = self.commands.send(crate::core::Command::SetMonitorVolume {
+                        value: volume.round() as u32,
+                    });
+                }
+                ui.label(small(
+                    "Только для вас: 0 % — тишина в колонках, в микрофон трек идёт как обычно.",
+                ));
+            } else {
+                ui.label(small("На Windows мониторинг недоступен: музыка и голос идут в CABLE Input."));
+            }
+        });
+
+        ui.add_space(12.0);
+        card(ui, "Поиск и запуск", |ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.music_query)
-                    .hint_text("например: Harvest Moon или https://youtu.be/...")
+                    .hint_text("Название трека или ссылка YouTube / SoundCloud")
                     .desired_width(ui.available_width()),
             );
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Играть в микрофон").clicked() || enter {
-                    self.play(self.music_query.clone());
-                }
-                let music_volume = self.state.audio.music_volume;
-                ui.label(small(format!("музыка: {music_volume}%")));
-            });
+            if enter {
+                self.play(self.music_query.clone());
+            }
+
+            let query = self.music_query.trim().to_string();
+            if !query.is_empty() {
+                ui.add_space(8.0);
+                ui.label(small("Результат"));
+                egui::Frame::new()
+                    .fill(CARD_HOVER)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .corner_radius(10.0)
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("♪").size(24.0).color(ACCENT));
+                            ui.vertical(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(query.clone()).size(13.0).color(TEXT),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.label(small("нажмите ▶, чтобы пустить в микрофон"));
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new("+").size(18.0))
+                                            .min_size(Vec2::new(32.0, 30.0)),
+                                    )
+                                    .on_hover_text("Добавить в плитки")
+                                    .clicked()
+                                {
+                                    let title = query.clone();
+                                    let _ = self.commands.send(crate::core::Command::AddTile {
+                                        title,
+                                        query: query.clone(),
+                                    });
+                                    self.music_query.clear();
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new("▶").size(18.0))
+                                            .min_size(Vec2::new(36.0, 30.0)),
+                                    )
+                                    .on_hover_text("Играть в микрофон")
+                                    .clicked()
+                                {
+                                    self.play(query.clone());
+                                }
+                            });
+                        });
+                    });
+            }
             ui.label(small(
                 "Поток идёт через yt-dlp и mpv прямо в виртуальный микрофон, без скачивания.",
             ));
@@ -844,60 +997,28 @@ impl App {
 
         ui.add_space(12.0);
         card(ui, "Плитки", |ui| {
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.tile_title)
-                        .hint_text("Название")
-                        .desired_width(140.0),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.tile_query)
-                        .hint_text("ссылка или название трека")
-                        .desired_width(ui.available_width() - 96.0),
-                );
-                if ui.button("+").clicked() {
-                    let title = self.tile_title.clone();
-                    let query = self.tile_query.clone();
-                    if !query.trim().is_empty() {
-                        let _ = self.commands.send(crate::core::Command::AddTile { title, query });
-                        self.tile_title.clear();
-                        self.tile_query.clear();
-                    }
-                }
-            });
-            ui.add_space(8.0);
             let tiles = self.state.tiles.clone();
             if tiles.is_empty() {
-                ui.label(RichText::new("Плиток пока нет").color(MUTED));
+                ui.label(RichText::new("Плиток пока нет").size(14.0).color(TEXT));
+                ui.label(small(
+                    "Введите трек в поиске выше и нажмите «+», чтобы добавить его сюда.",
+                ));
             } else {
                 let mut play: Option<String> = None;
                 let mut remove: Option<String> = None;
-                egui::Grid::new("tiles")
-                    .num_columns(2)
-                    .spacing([8.0, 8.0])
-                    .show(ui, |ui| {
-                        for (index, tile) in tiles.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_sized(
-                                        [ui.available_width() - 28.0, 44.0],
-                                        egui::Button::new(&tile.title),
-                                    )
-                                    .clicked()
-                                {
-                                    play = Some(tile.query.clone());
-                                }
-                                if ui.button("×").clicked() {
-                                    remove = Some(tile.id.clone());
-                                }
-                            });
-                            if index % 2 == 1 {
-                                ui.end_row();
+                for chunk in tiles.chunks(2) {
+                    ui.columns(2, |columns| {
+                        for (index, tile) in chunk.iter().enumerate() {
+                            let (play_tile, remove_tile) = tile_card(&mut columns[index], tile);
+                            if play_tile {
+                                play = Some(tile.query.clone());
+                            }
+                            if remove_tile {
+                                remove = Some(tile.id.clone());
                             }
                         }
                     });
-                if tiles.len() % 2 == 1 {
-                    // Grid needs a trailing cell to keep the last row aligned.
+                    ui.add_space(8.0);
                 }
                 if let Some(id) = remove {
                     let _ = self.commands.send(crate::core::Command::RemoveTile { tile_id: id });
@@ -909,372 +1030,6 @@ impl App {
         });
     }
 
-    // ------------------------------------------------------------ translation
-
-    fn tab_translate(&mut self, ui: &mut egui::Ui) {
-        let status = self.state.translate.clone();
-        let online = self.service_running();
-
-        card(ui, "Внешний переводчик", |ui| {
-            let mut enabled = self.settings.translate_enabled;
-            if ui.checkbox(&mut enabled, "Использовать перевод").changed() {
-                self.settings.translate_enabled = enabled;
-                self.send(crate::core::Command::SetTranslate { enabled });
-            }
-            ui.label(small(
-                "Демон отдаёт чистый голос переводчику и смешивает его ответ обратно \
-                 в микрофон. Встроенный движок на Python можно включить ниже; любой \
-                 внешний переводчик тоже работает через те же PCM-потоки.",
-            ));
-            if status.active {
-                ui.colored_label(ACCENT, "● Переводчик говорит прямо сейчас");
-            } else {
-                ui.label(small("● Переводчик молчит"));
-            }
-        });
-
-        ui.add_space(12.0);
-        card(ui, "Языки и режим", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("С языка");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.settings.translate_from)
-                            .hint_text("ru")
-                            .desired_width(70.0),
-                    )
-                    .changed()
-                {
-                    self.send(crate::core::Command::SetTranslateLanguages {
-                        from: self.settings.translate_from.clone(),
-                        to: self.settings.translate_to.clone(),
-                    });
-                }
-                ui.label("→");
-                ui.label("На язык");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.settings.translate_to)
-                            .hint_text("en")
-                            .desired_width(70.0),
-                    )
-                    .changed()
-                {
-                    self.send(crate::core::Command::SetTranslateLanguages {
-                        from: self.settings.translate_from.clone(),
-                        to: self.settings.translate_to.clone(),
-                    });
-                }
-            });
-            ui.add_space(6.0);
-            let mode_label = match self.settings.translate_mode {
-                TranslateMode::Replace => "Заменять голос",
-                TranslateMode::Mix => "Смешивать с голосом",
-            };
-            egui::ComboBox::from_label("Режим")
-                .selected_text(mode_label)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_value(
-                            &mut self.settings.translate_mode,
-                            TranslateMode::Replace,
-                            "Заменять голос",
-                        )
-                        .clicked()
-                    {
-                        self.send(crate::core::Command::SetTranslateMode {
-                            mode: TranslateMode::Replace,
-                        });
-                    }
-                    if ui
-                        .selectable_value(
-                            &mut self.settings.translate_mode,
-                            TranslateMode::Mix,
-                            "Смешивать с голосом",
-                        )
-                        .clicked()
-                    {
-                        self.send(crate::core::Command::SetTranslateMode {
-                            mode: TranslateMode::Mix,
-                        });
-                    }
-                });
-            ui.add_space(6.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut self.settings.translate_volume, 0..=100)
-                        .text("Громкость перевода"),
-                )
-                .changed()
-            {
-                self.send(crate::core::Command::SetTranslateVolume {
-                    value: self.settings.translate_volume,
-                });
-            }
-            ui.label(small(
-                "В режиме «Заменять голос» ваш голос заглушается, пока переводчик говорит.",
-            ));
-        });
-
-        ui.add_space(12.0);
-        card(ui, "Движки перевода", |ui| {
-            let cuda = self.engine_probe.cuda;
-            egui::ComboBox::from_label("Пресет")
-                .selected_text(self.settings.engine_preset.label())
-                .show_ui(ui, |ui| {
-                    for &preset in EnginePreset::ALL {
-                        if ui
-                            .selectable_value(
-                                &mut self.settings.engine_preset,
-                                preset,
-                                preset.label(),
-                            )
-                            .clicked()
-                            && preset != EnginePreset::Custom
-                        {
-                            let (asr, mt, tts) = engines::preset_engines(preset, cuda);
-                            self.settings.asr_engine = asr;
-                            self.settings.mt_engine = mt;
-                            self.settings.tts_engine = tts;
-                        }
-                    }
-                });
-            ui.label(small(engines::preset_hint(
-                self.settings.engine_preset,
-                &self.engine_probe,
-            )));
-
-            ui.add_space(6.0);
-            egui::ComboBox::from_label("Распознавание")
-                .selected_text(self.settings.asr_engine.as_str())
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_value(
-                            &mut self.settings.asr_engine,
-                            AsrEngine::FasterWhisper,
-                            "faster-whisper (локально)",
-                        )
-                        .clicked()
-                    {
-                        self.settings.engine_preset = EnginePreset::Custom;
-                    }
-                    if ui
-                        .selectable_value(
-                            &mut self.settings.asr_engine,
-                            AsrEngine::Groq,
-                            "Groq Whisper (облако)",
-                        )
-                        .clicked()
-                    {
-                        self.settings.engine_preset = EnginePreset::Custom;
-                    }
-                });
-            egui::ComboBox::from_label("Перевод")
-                .selected_text(self.settings.mt_engine.as_str())
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_value(&mut self.settings.mt_engine, MtEngine::OpenAi, "OpenAI-совместимый API")
-                        .clicked()
-                    {
-                        self.settings.engine_preset = EnginePreset::Custom;
-                    }
-                    if ui
-                        .selectable_value(&mut self.settings.mt_engine, MtEngine::Argos, "Argos (локально)")
-                        .clicked()
-                    {
-                        self.settings.engine_preset = EnginePreset::Custom;
-                    }
-                });
-            egui::ComboBox::from_label("Голос")
-                .selected_text(self.settings.tts_engine.as_str())
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_value(&mut self.settings.tts_engine, TtsEngine::Kokoro, "Kokoro")
-                        .clicked()
-                    {
-                        self.settings.engine_preset = EnginePreset::Custom;
-                    }
-                    if ui
-                        .selectable_value(&mut self.settings.tts_engine, TtsEngine::Chatterbox, "Chatterbox (клон)")
-                        .clicked()
-                    {
-                        self.settings.engine_preset = EnginePreset::Custom;
-                    }
-                    if ui
-                        .selectable_value(&mut self.settings.tts_engine, TtsEngine::Xtts, "XTTS v2 (клон)")
-                        .clicked()
-                    {
-                        self.settings.engine_preset = EnginePreset::Custom;
-                    }
-                });
-
-            let target_lang = self.settings.translate_to.clone();
-            if !target_lang.trim().is_empty()
-                && !engines::language_supported(
-                    self.settings.tts_engine,
-                    &target_lang,
-                    &self.engine_probe,
-                )
-            {
-                ui.colored_label(
-                    AMBER,
-                    format!("⚠ {} не поддерживает язык «{target_lang}»", self.settings.tts_engine.as_str()),
-                );
-            }
-            if self.settings.tts_engine.clones_voice() {
-                if !self.engine_probe.cuda {
-                    ui.colored_label(
-                        AMBER,
-                        "⚠ Клонирование голоса без CUDA работает очень медленно; выберите Kokoro или включите CUDA.",
-                    );
-                }
-                if !self.engine_probe.error.is_empty() {
-                    // The probe may have failed; do not claim the package exists.
-                } else if !self.engine_probe.has(self.settings.tts_engine.as_str()) {
-                    ui.colored_label(AMBER, "⚠ Пакет TTS не найден — проверьте компоненты ниже.");
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Образец голоса (wav):");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.voice_sample)
-                            .hint_text("/path/to/voice.wav")
-                            .desired_width(220.0),
-                    );
-                });
-            }
-
-            if self.settings.asr_engine == AsrEngine::Groq {
-                ui.horizontal(|ui| {
-                    ui.label("Groq key:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.groq_api_key)
-                            .password(true)
-                            .desired_width(180.0),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Модель:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.groq_model)
-                            .desired_width(180.0),
-                    );
-                });
-                ui.label(small("При 429 автоматически используется локальный faster-whisper."));
-            }
-            if self.settings.mt_engine == MtEngine::OpenAi {
-                ui.horizontal(|ui| {
-                    ui.label("API base:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.openai_base_url)
-                            .desired_width(200.0),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("API key:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.openai_api_key)
-                            .password(true)
-                            .desired_width(180.0),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Модель:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.openai_model)
-                            .desired_width(180.0),
-                    );
-                });
-            }
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Проверить компоненты").clicked() {
-                    self.probe_busy = true;
-                    spawn_probe_worker(self.event_tx.clone());
-                }
-                if self.state.engine_running {
-                    ui.colored_label(GREEN, "● Движок запущен");
-                } else {
-                    ui.label(small("○ Движок не запущен"));
-                }
-            });
-            if self.probe_busy {
-                ui.label(small("Проверка Python и пакетов…"));
-            } else if !self.engine_probe.error.is_empty() {
-                ui.colored_label(RED, self.engine_probe.error.as_str());
-            } else {
-                ui.label(small(format!(
-                    "Python {} · CUDA: {}",
-                    self.engine_probe.python,
-                    if self.engine_probe.cuda { "да" } else { "нет" }
-                )));
-                let installed: Vec<&str> = [
-                    ("faster-whisper", self.engine_probe.faster_whisper),
-                    ("argos", self.engine_probe.argos),
-                    ("kokoro", self.engine_probe.kokoro),
-                    ("chatterbox", self.engine_probe.chatterbox),
-                    ("xtts", self.engine_probe.xtts),
-                ]
-                .iter()
-                .filter(|(_, ok)| *ok)
-                .map(|(name, _)| *name)
-                .collect();
-                ui.label(small(format!(
-                    "Установлено: {}",
-                    if installed.is_empty() {
-                        "ничего (нужен Python 3)".to_string()
-                    } else {
-                        installed.join(", ")
-                    }
-                )));
-            }
-            ui.label(small(format!("Журнал: {}", engines::log_path().display())));
-            ui.label(small(
-                "Движок запускается демоном, только когда включён перевод.",
-            ));
-            if ui.button("Сохранить и применить").clicked() {
-                self.save_engines();
-            }
-        });
-
-        ui.add_space(12.0);
-        card(ui, "Потоки PCM", |ui| {
-            kv(
-                ui,
-                "Голос → переводчик",
-                if status.voice_connected {
-                    "подключён"
-                } else {
-                    "ожидание подключения"
-                },
-            );
-            kv(
-                ui,
-                "Перевод → микрофон",
-                if status.translate_connected {
-                    "подключён"
-                } else {
-                    "ожидание подключения"
-                },
-            );
-            kv(
-                ui,
-                "Уровень перевода",
-                &format!("{:.0} дБ", status.level_db),
-            );
-            let (voice, translated) = crate::mixer::endpoints();
-            ui.add_space(6.0);
-            ui.label(small(format!("Читать голос: {voice}")));
-            ui.label(small(format!("Писать перевод: {translated}")));
-            ui.label(small("Формат: s16le, 48 kHz, mono."));
-            if !online {
-                ui.label(small(
-                    "Служба не запущена — локальные потоки появятся после её запуска.",
-                ));
-            }
-        });
-    }
-
     // ------------------------------------------------------------ settings
 
     fn tab_settings(&mut self, ui: &mut egui::Ui) {
@@ -1282,22 +1037,27 @@ impl App {
             let mut changed = false;
 
             let before = self.settings.transport.clone();
-            egui::ComboBox::from_label("Канал")
-                .selected_text(transport_label(&self.settings.transport))
-                .show_ui(ui, |ui| {
-                    for transport in config::TRANSPORTS {
-                        if ui
-                            .selectable_value(
-                                &mut self.settings.transport,
-                                transport.to_string(),
-                                transport_label(transport),
-                            )
-                            .clicked()
-                        {
-                            changed = true;
-                        }
-                    }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Канал").size(13.0).color(TEXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("transport")
+                        .selected_text(transport_label(&self.settings.transport))
+                        .show_ui(ui, |ui| {
+                            for transport in config::TRANSPORTS {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.settings.transport,
+                                        transport.to_string(),
+                                        transport_label(transport),
+                                    )
+                                    .clicked()
+                                {
+                                    changed = true;
+                                }
+                            }
+                        });
                 });
+            });
             if before != self.settings.transport {
                 changed = true;
             }
@@ -1335,151 +1095,47 @@ impl App {
                 ui.label(small("USB: телефон подключён кабелем, нужен adb."));
             }
 
-            ui.add_space(10.0);
-            ui.label("Выход в систему");
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.settings.device)
-                        .desired_width(ui.available_width()),
-                )
-                .changed()
-            {
-                changed = true;
-            }
             if cfg!(windows) {
+                ui.add_space(10.0);
+                ui.label("Выход в систему");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.settings.device)
+                            .desired_width(ui.available_width()),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
                 ui.label(small(
                     "Windows: приложения должны записывать с CABLE Output (VB-CABLE).",
-                ));
-            } else {
-                ui.label(small(
-                    "Linux: PipeWire сам создаёт rustmic_sink и источник rustmic_mic.",
                 ));
             }
 
             if changed {
+                self.settings_dirty = true;
+            }
+
+            if self.settings_dirty {
                 ui.add_space(10.0);
-                if ui.button("Сохранить и перезапустить службу").clicked() {
-                    self.persist_audio();
-                    match self.settings.save() {
-                        Ok(()) => {
-                            self.notify("Настройки подключения сохранены".into());
-                            self.restart_service();
-                        }
-                        Err(error) => {
-                            self.notify(format!("Не удалось сохранить настройки: {error}"))
+                ui.horizontal(|ui| {
+                    let save = egui::Button::new(RichText::new("Сохранить и перезапустить службу")
+                        .color(BG))
+                        .fill(ACCENT);
+                    if ui.add(save).clicked() {
+                        match self.settings.save() {
+                            Ok(()) => {
+                                self.settings_dirty = false;
+                                self.notify("Настройки подключения сохранены".into());
+                                self.restart_service();
+                            }
+                            Err(error) => {
+                                self.notify(format!("Не удалось сохранить настройки: {error}"))
+                            }
                         }
                     }
-                }
-            }
-        });
-
-        ui.add_space(12.0);
-        card(ui, "Звук", |ui| {
-            let mut denoise = self.state.audio.denoise;
-            if ui.checkbox(&mut denoise, "Шумодав RNNoise").changed() {
-                self.state.audio.denoise = denoise;
-                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
-                self.send(crate::core::Command::SetDenoise { enabled: denoise });
-            }
-
-            let mut mic_volume = self.state.audio.mic_volume;
-            let response = ui.add(
-                egui::Slider::new(&mut mic_volume, 0..=100)
-                    .text("Микрофон")
-                    .suffix("%"),
-            );
-            if response.changed() {
-                self.state.audio.mic_volume = mic_volume;
-                self.settings.mic_volume = mic_volume;
-                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
-            }
-            if response.drag_stopped()
-                || (response.changed() && !ui.input(|i| i.pointer.any_down()))
-            {
-                let _ = self
-                    .commands
-                    .send(crate::core::Command::SetMicVolume { value: mic_volume });
-            }
-
-            let mut music_volume = self.state.audio.music_volume;
-            let response = ui.add(
-                egui::Slider::new(&mut music_volume, 0..=100)
-                    .text("Музыка")
-                    .suffix("%"),
-            );
-            if response.changed() {
-                self.state.audio.music_volume = music_volume;
-                self.settings.music_volume = music_volume;
-                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
-            }
-            if response.drag_stopped()
-                || (response.changed() && !ui.input(|i| i.pointer.any_down()))
-            {
-                let _ = self
-                    .commands
-                    .send(crate::core::Command::SetMusicVolume { value: music_volume });
-            }
-
-            ui.add_space(4.0);
-            let mut loudnorm = self.state.audio.loudnorm;
-            if ui.checkbox(&mut loudnorm, "Выравнивание громкости (loudnorm)").changed() {
-                self.state.audio.loudnorm = loudnorm;
-                self.settings.loudnorm = loudnorm;
-                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
-                let _ = self.commands.send(crate::core::Command::SetLoudnorm {
-                    enabled: loudnorm,
+                    ui.label(small("есть несохранённые изменения"));
                 });
-            }
-            let mut ducking = self.state.audio.ducking;
-            if ui
-                .checkbox(&mut ducking, "Приглушать музыку, когда гейт открыт")
-                .changed()
-            {
-                self.state.audio.ducking = ducking;
-                self.settings.ducking = ducking;
-                self.audio_edit_until = Instant::now() + Duration::from_millis(700);
-                let _ = self
-                    .commands
-                    .send(crate::core::Command::SetDucking { enabled: ducking });
-            }
-            if self.state.audio.ducking {
-                let mut ducking_db = self.state.audio.ducking_db;
-                let response = ui.add(
-                    egui::Slider::new(&mut ducking_db, 0.0..=30.0)
-                        .text("Затухание")
-                        .suffix(" dB"),
-                );
-                if response.changed() {
-                    self.state.audio.ducking_db = ducking_db;
-                    self.settings.ducking_db = ducking_db;
-                    self.audio_edit_until = Instant::now() + Duration::from_millis(700);
-                }
-                if response.drag_stopped()
-                    || (response.changed() && !ui.input(|i| i.pointer.any_down()))
-                {
-                    let _ = self
-                        .commands
-                        .send(crate::core::Command::SetDuckingDb { value: ducking_db });
-                }
-            }
-            let mut monitor = self.state.audio.monitor_music;
-            if !cfg!(windows) {
-                if ui
-                    .checkbox(&mut monitor, "Слышать музыку в колонках")
-                    .changed()
-                {
-                    self.state.audio.monitor_music = monitor;
-                    self.settings.monitor_music = monitor;
-                    self.audio_edit_until = Instant::now() + Duration::from_millis(700);
-                    let _ = self
-                        .commands
-                        .send(crate::core::Command::SetMonitor { enabled: monitor });
-                }
-            } else {
-                ui.add_enabled(
-                    false,
-                    egui::Checkbox::new(&mut monitor, "Мониторинг только на Linux"),
-                );
             }
         });
 
@@ -1487,40 +1143,24 @@ impl App {
         card(ui, "Система", |ui| {
             if cfg!(unix) {
                 let mut default_mic = self.default_mic;
-                if ui
-                    .checkbox(&mut default_mic, "Сделать RustMIC микрофоном по умолчанию")
-                    .changed()
-                {
+                if toggle_row(
+                    ui,
+                    "Сделать RustMIC микрофоном по умолчанию",
+                    &mut default_mic,
+                    true,
+                    "Системные приложения будут сразу выбирать rustmic_mic",
+                ) {
                     self.default_mic = default_mic;
                     thread::spawn(move || {
                         let _ = audio::set_default(default_mic);
                     });
                 }
             }
-            egui::Grid::new("system-info")
-                .num_columns(2)
-                .spacing([20.0, 8.0])
-                .show(ui, |ui| {
-                    kv(ui, "Версия", env!("CARGO_PKG_VERSION"));
-                    kv(ui, "Протокол", "v1");
-                    kv(ui, "Сокет", &ipc::socket_display());
-                    kv(
-                        ui,
-                        "PID демона",
-                        &if self.state.daemon_pid == 0 {
-                            "—".into()
-                        } else {
-                            self.state.daemon_pid.to_string()
-                        },
-                    );
-                });
+
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.button("Перезапустить").clicked() {
+                if ui.button("Перезапустить службу").clicked() {
                     self.restart_service();
-                }
-                if ui.button("Тест микрофона").clicked() {
-                    platform::test_mic();
                 }
                 if ui.button("Журнал").clicked() {
                     platform::open_log();
@@ -1553,6 +1193,29 @@ impl App {
                         );
                     });
             }
+
+            ui.add_space(10.0);
+            egui::CollapsingHeader::new("О программе")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("about-info")
+                        .num_columns(2)
+                        .spacing([20.0, 8.0])
+                        .show(ui, |ui| {
+                            kv(ui, "Версия", env!("CARGO_PKG_VERSION"));
+                            kv(ui, "Протокол", "v1");
+                            kv(ui, "Сокет", &ipc::socket_display());
+                            kv(
+                                ui,
+                                "PID демона",
+                                &if self.state.daemon_pid == 0 {
+                                    "—".into()
+                                } else {
+                                    self.state.daemon_pid.to_string()
+                                },
+                            );
+                        });
+                });
         });
 
         if let Some(notice) = &self.notice {
@@ -1621,7 +1284,6 @@ impl eframe::App for App {
                         match self.tab {
                             Tab::Mic => self.tab_microphone(ui),
                             Tab::Pad => self.tab_soundpad(ui),
-                            Tab::Translate => self.tab_translate(ui),
                             Tab::Settings => self.tab_settings(ui),
                         }
                         ui.add_space(20.0);
@@ -1640,7 +1302,7 @@ fn spawn_state_reader(tx: Sender<UiEvent>) {
                 Ok(mut client) => loop {
                     match client.recv() {
                         Ok(state) => {
-                            if tx.send(UiEvent::State(state)).is_err() {
+                            if tx.send(UiEvent::State(Box::new(state))).is_err() {
                                 return;
                             }
                         }
@@ -1680,17 +1342,6 @@ fn spawn_command_worker(rx: Receiver<crate::core::Command>, tx: Sender<UiEvent>)
                     let _ = tx.send(UiEvent::Notice(format!("Команда не выполнена: {error}")));
                 }
             }
-        })
-        .ok();
-}
-
-/// One-shot probe. The button in the translation tab calls it again on demand.
-fn spawn_probe_worker(tx: Sender<UiEvent>) {
-    thread::Builder::new()
-        .name("RustMIC-gui-probe".into())
-        .spawn(move || {
-            let result = engines::probe();
-            let _ = tx.send(UiEvent::Probe(result));
         })
         .ok();
 }
@@ -1874,8 +1525,247 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     )
 }
 
-/// Big level meter with a draggable gate line (level mode) and a VAD strip
-/// (voice mode). Returns a new gate value while the line is being dragged.
+// ---------------------------------------------------------------- widgets
+
+struct SliderRow {
+    changed: bool,
+    committed: bool,
+}
+
+/// One line: label on the left, full-width slider in the middle, value on the
+/// right. Every numeric setting in the app uses this layout.
+fn slider_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    suffix: &str,
+    decimals: usize,
+) -> SliderRow {
+    let mut changed = false;
+    let mut committed = false;
+
+    ui.horizontal(|ui| {
+        let full = ui.available_width();
+        let label_width = (full * 0.34).clamp(96.0, 168.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(label_width, 20.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.add(egui::Label::new(RichText::new(label).size(13.0).color(TEXT)).truncate());
+            },
+        );
+
+        let value_width = 58.0;
+        let slider_width = (ui.available_width() - value_width - 8.0).max(60.0);
+        let response = ui.add_sized(
+            Vec2::new(slider_width, 20.0),
+            egui::Slider::new(value, range)
+                .show_value(false)
+                .trailing_fill(false),
+        );
+        changed = response.changed();
+        committed = response.drag_stopped()
+            || (response.changed() && !ui.input(|i| i.pointer.any_down()));
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{value:.*}{suffix}", decimals))
+                        .size(13.0)
+                        .color(TEXT),
+                )
+                .truncate(),
+            );
+        });
+    });
+
+    SliderRow { changed, committed }
+}
+
+/// Theme-styled switch used instead of checkboxes.
+fn switch(ui: &mut egui::Ui, on: &mut bool) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(38.0, 20.0), Sense::click());
+    let mut response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+
+    let t = ui.ctx().animate_bool_responsive(response.id, *on);
+    let radius = rect.height() / 2.0;
+    let bg = lerp_color(Color32::from_rgb(45, 54, 66), ACCENT, t);
+    ui.painter().rect_filled(rect, radius, bg);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, lerp_color(BORDER, ACCENT, t)),
+        egui::StrokeKind::Inside,
+    );
+    let pad = 2.5;
+    let knob_x = egui::lerp(rect.left() + radius..=rect.right() - radius, t);
+    ui.painter().circle_filled(
+        egui::pos2(knob_x, rect.center().y),
+        radius - pad,
+        if *on { Color32::from_rgb(8, 30, 25) } else { MUTED },
+    );
+
+    response.changed()
+}
+
+/// Label on the left, switch on the right.
+fn toggle_row(ui: &mut egui::Ui, label: &str, value: &mut bool, enabled: bool, hint: &str) -> bool {
+    let mut changed = false;
+    let response = ui
+        .add_enabled_ui(enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(label)
+                            .size(13.0)
+                            .color(if enabled { TEXT } else { MUTED }),
+                    )
+                    .truncate(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    changed = switch(ui, value);
+                });
+            });
+        })
+        .response;
+    response.on_hover_text(hint);
+    changed
+}
+
+/// Colored dot + label on the left, value on the right.
+fn dot_row(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+        ui.painter().circle_filled(rect.center(), 3.5, color);
+        ui.label(RichText::new(label).size(13.0).color(MUTED));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(value).size(13.0).color(color));
+        });
+    });
+}
+
+/// "Infinix X6836 · USB" style header for the microphone tab.
+fn connection_summary(
+    connection: &crate::core::ConnectionState,
+) -> (String, &'static str, Color32) {
+    let transport = transport_label(&connection.transport);
+    let title = match phone_model(&connection.phone) {
+        Some(model) => format!("{model} · {transport}"),
+        None => format!("Телефон · {transport}"),
+    };
+    let (text, color) = if connection.phone_connected {
+        ("подключён", GREEN)
+    } else if connection.client_running {
+        ("нет связи", AMBER)
+    } else {
+        ("не подключён", RED)
+    };
+    (title, text, color)
+}
+
+fn phone_model(phone: &str) -> Option<String> {
+    let open = phone.rfind('(')?;
+    let close = open + phone[open..].find(')')?;
+    let model = phone[open + 1..close].trim();
+    if model.is_empty() || model.eq_ignore_ascii_case("usb") {
+        None
+    } else {
+        Some(model.to_string())
+    }
+}
+
+/// Tile card used inside the two-column soundpad grid.
+fn tile_card(ui: &mut egui::Ui, tile: &Tile) -> (bool, bool) {
+    let mut play = false;
+    let mut remove = false;
+
+    egui::Frame::new()
+        .fill(CARD_HOVER)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(10.0)
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                if let Some(cover) = tile.cover.clone() {
+                    ui.add(
+                        egui::Image::from_uri(cover)
+                            .fit_to_exact_size(Vec2::splat(40.0))
+                            .corner_radius(6.0),
+                    );
+                } else {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+                    ui.painter().rect_filled(rect, 6.0, CARD);
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "♪",
+                        FontId::proportional(18.0),
+                        ACCENT,
+                    );
+                }
+                ui.vertical(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(if tile.title.is_empty() {
+                                tile.query.clone()
+                            } else {
+                                tile.title.clone()
+                            })
+                            .size(13.0)
+                            .color(TEXT),
+                        )
+                        .truncate(),
+                    );
+                    ui.label(small(if tile.duration > 0.0 {
+                        clock(tile.duration)
+                    } else {
+                        "трек".into()
+                    }));
+                });
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("▶ Играть").size(12.0))
+                            .min_size(Vec2::new(0.0, 24.0)),
+                    )
+                    .clicked()
+                {
+                    play = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("×").size(15.0))
+                                .min_size(Vec2::new(26.0, 24.0)),
+                        )
+                        .on_hover_text("Удалить плитку")
+                        .clicked()
+                    {
+                        remove = true;
+                    }
+                });
+            });
+        });
+
+    (play, remove)
+}
+
+// ---------------------------------------------------------------- meter
+
+/// Input level. In VAD mode the scale is voice probability in percent, in
+/// level mode it is dBFS. The amber marker is the gate threshold and can be
+/// dragged right on the scale.
 fn level_meter(
     ui: &mut egui::Ui,
     levels: &Levels,
@@ -1883,105 +1773,105 @@ fn level_meter(
     smooth_db: f32,
     peak_db: f32,
 ) -> Option<GateChange> {
+    let voice = audio.gate_mode == GateMode::Voice;
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 96.0), Sense::click_and_drag());
+    let height = if voice { 140.0 } else { 132.0 };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
 
-    let meter = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width(), 68.0));
-    painter.rect_filled(meter, 10.0, Color32::from_rgb(8, 12, 16));
-    painter.rect_stroke(
-        meter,
-        10.0,
-        Stroke::new(1.0, BORDER),
-        egui::StrokeKind::Inside,
-    );
-
-    let inner = meter.shrink2(Vec2::new(8.0, 9.0));
-    let fraction = db_fraction(smooth_db);
-    if fraction > 0.0 {
-        let steps = 48;
-        for index in 0..steps {
-            let t0 = index as f32 / steps as f32;
-            let t1 = (index + 1) as f32 / steps as f32;
-            if t0 > fraction {
-                break;
-            }
-            let color = db_color(-60.0 + t0 * 60.0);
-            let segment = egui::Rect::from_min_max(
-                egui::pos2(inner.left() + inner.width() * t0, inner.top()),
-                egui::pos2(
-                    inner.left() + inner.width() * t1.min(fraction),
-                    inner.bottom(),
-                ),
-            );
-            painter.rect_filled(segment, 0.0, color);
-        }
-    }
-
-    // Peak marker.
-    if peak_db > -59.5 {
-        let x = inner.left() + inner.width() * db_fraction(peak_db);
-        painter.line_segment(
-            [egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom())],
-            Stroke::new(1.5, Color32::WHITE.gamma_multiply(0.85)),
-        );
-    }
-
-    // Tick lines and labels.
-    for db in [-48.0, -36.0, -24.0, -12.0] {
-        let x = inner.left() + inner.width() * db_fraction(db);
-        painter.line_segment(
-            [egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom())],
-            Stroke::new(1.0, Color32::from_black_alpha(60)),
-        );
-        painter.text(
-            egui::pos2(x, meter.bottom() + 2.0),
-            Align2::CENTER_TOP,
-            format!("{db:.0}"),
-            FontId::proportional(9.0),
-            MUTED,
-        );
-    }
-    painter.text(
-        egui::pos2(inner.right(), meter.bottom() + 2.0),
-        Align2::RIGHT_TOP,
-        "0 dB",
-        FontId::proportional(9.0),
-        MUTED,
-    );
-
     let mut change = None;
-    let voice = audio.gate_mode == GateMode::Voice;
 
     if voice {
-        let strip = egui::Rect::from_min_max(
-            egui::pos2(inner.left(), meter.bottom() + 16.0),
-            egui::pos2(inner.right(), meter.bottom() + 25.0),
+        let track = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width(), 48.0));
+        painter.rect_filled(track, 10.0, Color32::from_rgb(8, 12, 16));
+        painter.rect_stroke(
+            track,
+            10.0,
+            Stroke::new(1.0, BORDER),
+            egui::StrokeKind::Inside,
         );
-        painter.rect_filled(strip, 4.0, Color32::from_rgb(8, 12, 16));
+
+        let inner = track.shrink2(Vec2::new(8.0, 9.0));
         let vad = levels.vad.clamp(0.0, 1.0);
-        let filled = egui::Rect::from_min_size(
-            strip.min,
-            Vec2::new(strip.width() * vad, strip.height()),
-        );
-        painter.rect_filled(filled, 4.0, ACCENT.gamma_multiply(0.7));
+        if vad > 0.0 {
+            let steps = 40;
+            for index in 0..steps {
+                let t0 = index as f32 / steps as f32;
+                let t1 = (index + 1) as f32 / steps as f32;
+                if t0 > vad {
+                    break;
+                }
+                let segment = egui::Rect::from_min_max(
+                    egui::pos2(inner.left() + inner.width() * t0, inner.top()),
+                    egui::pos2(inner.left() + inner.width() * t1.min(vad), inner.bottom()),
+                );
+                painter.rect_filled(
+                    segment,
+                    0.0,
+                    lerp_color(ACCENT_DIM, ACCENT, t0),
+                );
+            }
+        }
+
+        for percent in [0.0_f32, 25.0, 50.0, 75.0, 100.0] {
+            let x = inner.left() + inner.width() * percent / 100.0;
+            painter.line_segment(
+                [egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom())],
+                Stroke::new(1.0, Color32::from_black_alpha(70)),
+            );
+            let (anchor, x) = if percent <= 0.5 {
+                (Align2::LEFT_TOP, inner.left())
+            } else if percent >= 99.5 {
+                (Align2::RIGHT_TOP, inner.right())
+            } else {
+                (Align2::CENTER_TOP, x)
+            };
+            painter.text(
+                egui::pos2(x, track.bottom() + 3.0),
+                anchor,
+                format!("{percent:.0}%"),
+                FontId::proportional(9.0),
+                MUTED,
+            );
+        }
+
         let threshold = audio.gate_voice as f32 / 100.0;
-        let x = strip.left() + strip.width() * threshold;
+        let x = inner.left() + inner.width() * threshold;
         painter.line_segment(
-            [egui::pos2(x, strip.top() - 2.0), egui::pos2(x, strip.bottom() + 2.0)],
+            [
+                egui::pos2(x, track.top() - 3.0),
+                egui::pos2(x, track.bottom() + 3.0),
+            ],
             Stroke::new(2.0, AMBER),
         );
+        painter.circle_filled(egui::pos2(x, track.bottom()), 5.0, AMBER);
+
         painter.text(
-            egui::pos2(strip.left(), strip.bottom() + 3.0),
+            egui::pos2(rect.left(), track.bottom() + 18.0),
             Align2::LEFT_TOP,
-            format!("VAD {:.0}% · порог {:.0}%", vad * 100.0, threshold * 100.0),
-            FontId::proportional(9.0),
+            format!("вероятность голоса {:.0}% · порог {:.0}%", vad * 100.0, threshold * 100.0),
+            FontId::proportional(11.0),
+            if levels.gate_open { GREEN } else { MUTED },
+        );
+        painter.text(
+            egui::pos2(rect.left(), track.bottom() + 36.0),
+            Align2::LEFT_TOP,
+            "Жёлтая метка — порог гейта. Тяните её по шкале:",
+            FontId::proportional(10.0),
+            MUTED,
+        );
+        painter.text(
+            egui::pos2(rect.left(), track.bottom() + 50.0),
+            Align2::LEFT_TOP,
+            "выше порога микрофон открыт, ниже — закрыт.",
+            FontId::proportional(10.0),
             MUTED,
         );
 
         if response.dragged() || response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
-                let value = ((pos.x - strip.left()) / strip.width()).clamp(0.0, 1.0) * 100.0;
+                let value =
+                    ((pos.x - inner.left()) / inner.width()).clamp(0.0, 1.0) * 100.0;
                 change = Some(GateChange {
                     value: value.round(),
                     commit: response.drag_stopped() || response.clicked(),
@@ -1989,18 +1879,101 @@ fn level_meter(
             }
         }
     } else {
+        let meter = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width(), 64.0));
+        painter.rect_filled(meter, 10.0, Color32::from_rgb(8, 12, 16));
+        painter.rect_stroke(
+            meter,
+            10.0,
+            Stroke::new(1.0, BORDER),
+            egui::StrokeKind::Inside,
+        );
+
+        let inner = meter.shrink2(Vec2::new(8.0, 9.0));
+        let fraction = db_fraction(smooth_db);
+        if fraction > 0.0 {
+            let steps = 48;
+            for index in 0..steps {
+                let t0 = index as f32 / steps as f32;
+                let t1 = (index + 1) as f32 / steps as f32;
+                if t0 > fraction {
+                    break;
+                }
+                let segment = egui::Rect::from_min_max(
+                    egui::pos2(inner.left() + inner.width() * t0, inner.top()),
+                    egui::pos2(
+                        inner.left() + inner.width() * t1.min(fraction),
+                        inner.bottom(),
+                    ),
+                );
+                painter.rect_filled(segment, 0.0, db_color(-60.0 + t0 * 60.0));
+            }
+        }
+
+        if peak_db > -59.5 {
+            let x = inner.left() + inner.width() * db_fraction(peak_db);
+            painter.line_segment(
+                [egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom())],
+                Stroke::new(1.5, Color32::WHITE.gamma_multiply(0.85)),
+            );
+        }
+
+        for db in [-48.0_f32, -36.0, -24.0, -12.0, 0.0] {
+            let x = inner.left() + inner.width() * db_fraction(db);
+            painter.line_segment(
+                [egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom())],
+                Stroke::new(1.0, Color32::from_black_alpha(60)),
+            );
+            painter.text(
+                egui::pos2(x, meter.bottom() + 3.0),
+                Align2::CENTER_TOP,
+                format!("{db:.0}"),
+                FontId::proportional(9.0),
+                MUTED,
+            );
+        }
+        painter.text(
+            egui::pos2(inner.right(), meter.bottom() + 3.0),
+            Align2::RIGHT_TOP,
+            "dB",
+            FontId::proportional(9.0),
+            MUTED,
+        );
+
         let x = inner.left() + inner.width() * db_fraction(audio.gate_level_db);
         painter.line_segment(
-            [egui::pos2(x, inner.top() - 2.0), egui::pos2(x, inner.bottom() + 2.0)],
+            [
+                egui::pos2(x, meter.top() - 3.0),
+                egui::pos2(x, meter.bottom() + 3.0),
+            ],
             Stroke::new(2.0, AMBER),
         );
-        painter.circle_filled(egui::pos2(x, inner.bottom()), 5.0, AMBER);
+        painter.circle_filled(egui::pos2(x, meter.bottom()), 5.0, AMBER);
+
         painter.text(
-            egui::pos2(inner.left(), meter.bottom() + 16.0),
+            egui::pos2(rect.left(), meter.bottom() + 18.0),
             Align2::LEFT_TOP,
-            format!("порог {:.0} dB · гейт {}", audio.gate_level_db, if levels.gate_open { "открыт" } else { "закрыт" }),
+            format!(
+                "уровень {:.0} dB · порог {:.0} dB · гейт {}",
+                smooth_db,
+                audio.gate_level_db,
+                if levels.gate_open { "открыт" } else { "закрыт" }
+            ),
+            FontId::proportional(11.0),
+            if levels.gate_open { GREEN } else { MUTED },
+        );
+        painter.text(
+            egui::pos2(rect.left(), meter.bottom() + 36.0),
+            Align2::LEFT_TOP,
+            "Жёлтая метка — порог гейта. Тяните её по шкале:",
             FontId::proportional(10.0),
-            AMBER,
+            MUTED,
+        );
+        painter.text(
+            egui::pos2(rect.left(), meter.bottom() + 50.0),
+            Align2::LEFT_TOP,
+            "сигнал громче порога открывает микрофон.",
+            FontId::proportional(10.0),
+            MUTED,
         );
 
         if response.dragged() || response.clicked() {

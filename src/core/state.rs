@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{GateMode, Settings};
-use crate::{engines, level, mixer, music, tiles};
+use crate::{level, music, tiles};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -40,6 +40,7 @@ pub struct AudioState {
     pub gate_level_db: f32,
     pub mic_volume: u32,
     pub music_volume: u32,
+    pub monitor_volume: u32,
     pub muted: bool,
     pub loudnorm: bool,
     pub ducking: bool,
@@ -56,6 +57,7 @@ impl From<&Settings> for AudioState {
             gate_level_db: settings.gate_level_db,
             mic_volume: settings.mic_volume,
             music_volume: settings.music_volume,
+            monitor_volume: settings.monitor_volume,
             muted: false,
             loudnorm: settings.loudnorm,
             ducking: settings.ducking,
@@ -96,10 +98,6 @@ pub struct AppState {
     pub audio: AudioState,
     pub track: Option<TrackState>,
     pub tiles: Vec<Tile>,
-    /// External translator / PCM mixer status.
-    pub translate: mixer::TranslateStatus,
-    /// True while the bundled Python translation engine is alive.
-    pub engine_running: bool,
     /// ID of the last command this daemon has applied.
     pub last_command_id: u64,
     pub updated_at: u64,
@@ -117,8 +115,6 @@ impl Default for AppState {
             audio: AudioState::from(&Settings::default()),
             track: None,
             tiles: Vec::new(),
-            translate: mixer::status(),
-            engine_running: engines::running(),
             last_command_id: 0,
             updated_at: 0,
         }
@@ -146,8 +142,6 @@ impl AppState {
             audio: AudioState::from(settings),
             track: None,
             tiles: Vec::new(),
-            translate: mixer::status(),
-            engine_running: engines::running(),
             last_command_id: 0,
             updated_at: now(),
         }
@@ -166,8 +160,6 @@ impl AppState {
         };
         self.track = music::status();
         self.tiles = tiles::load();
-        self.translate = mixer::status();
-        self.engine_running = engines::running();
         self.updated_at = now();
     }
 }

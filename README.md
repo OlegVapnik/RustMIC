@@ -22,10 +22,7 @@ YouTube / YouTube Music / SoundCloud и смешивает звук в тот ж
   (MAC-адрес) — `adb` не нужен вообще.
 - **USB** через `adb`: классический режим WO Mic.
 - **Шумодав** RNNoise + гейт по VAD или по уровню (RMS, дБ), громкость 0–100 %.
-- **Музыка в микрофон**: name → `ytsearch1:<name>`, ссылки Passing-through.
-- **Голосовой перевод**: общий PCM-микшер в демоне, локальные потоки для
-  внешнего движка и опциональный встроенный конвейер Python: faster-whisper /
-  Groq → OpenAI-совместимый перевод / Argos → Kokoro / Chatterbox / XTTS.
+- **Музыка в микрофон**: name → `ytsearch1:<name>`, ссылки передаются как есть.
 - **Linux**: PipeWire null-sink → `module-remap-source` → `rustmic_mic`.
 - **Windows**: WASAPI → VB-CABLE, приложения выбирают **CABLE Output**.
 - **Один файл на Windows**: `RustMIC-portable.exe` распаковывается,
@@ -106,97 +103,6 @@ RustMIC stop-music
 иначе микрофон подхватит звук из колонок. В Discord/OBS выключите Krisp/шумодав,
 иначе он может вырезать музыку как «фоновый шум».
 
-## Голосовой перевод (PCM-микшер)
-
-Демон умеет отдавать очищенный голос внешнему переводчику и смешивать его
-синтезированную речь обратно в тот же виртуальный микрофон. Никакого облака
-внутри нет: подключается любой движок, который умеет читать/писать PCM.
-
-### Формат потоков
-
-| Параметр | Значение |
-| --- | --- |
-| Кодировка | `s16le` (signed 16-bit little-endian), без заголовка |
-| Частота | 48 000 Гц |
-| Каналы | 1 (моно) |
-| Размер сэмпла | 2 байта |
-| Байтовая скорость | 96 000 байт/с |
-| Типичный chunk | 1920 байт = 20 мс (движок может писать любыми кусками) |
-
-`RustMIC-voice` — демон **пишет** сюда чистый голос до смешивания. Переводчик
-читает этот поток и никогда не получает собственную речь обратно: пока он
-говорит, в него уходит тишина. `RustMIC-translate` — переводчик **пишет** сюда
-синтезированную речь.
-
-Потоки создаются при запуске службы:
-
-- Linux: `~/.cache/RustMIC/RustMIC-voice.sock` и
-  `~/.cache/RustMIC/RustMIC-translate.sock`, права `0600`;
-- Windows: `\\.\pipe\RustMIC-voice` и `\\.\pipe\RustMIC-translate`.
-  Pipe создаётся с `PIPE_REJECT_REMOTE_CLIENTS` и SDDL-дескриптором
-  `O:<SID>G:<SID>D:P(A;;GA;;;<SID>)`, где `<SID>` — SID текущего пользователя.
-  По сети поток недоступен; другой пользователь этой машины тоже не сможет
-  к нему подключиться.
-
-Вкладка «Перевод» включает микшер, задаёт языки (`ru → en` по умолчанию),
-режим и громкость перевода. Там же видны подключение, уровень приходящей речи
-и счётчики буфера (`queued_ms`, `dropped_samples`, `underruns`).
-
-Смысл режимов:
-
-- `replace`: пока переводчик говорит, оригинал приглушается на
-  `ducking_db` (по умолчанию 12 дБ); между фразами оригинал идёт как есть.
-  Это же правило действует и для музыки — она приглушается и при открытом
-  гейте микрофона, и во время перевода;
-- `mix`: оригинал остаётся на полной громкости, перевод добавляется сверху.
-  Сумма проходит через мягкий лимитер (`tanh`-софт-клиппер), а не через
-  жёсткое отсечение, поэтому не появляется хрип.
-
-Из консоли:
-
-```fish
-RustMIC ctl translate on
-RustMIC ctl translate-langs ru en
-RustMIC ctl translate-mode replace   # или mix
-RustMIC ctl translate-volume 100
-```
-
-Буфер перевода ограничен одной секундой (48 000 сэмплов). При переполнении
-отбрасываются самые старые сэмплы — задержка не растёт. При пустом буфере
-подставляется цифровая тишина, а не повтор последнего куска. Счётчики
-`dropped_samples`/`underruns` и `queued_ms` видны в `RustMIC ctl state`.
-
-### Встроенный движок перевода
-
-Вместо внешней программы можно включить конвейер, который лежит внутри
-RustMIC. Он не нужен для работы микрофона и не требует установки пакетов,
-пока не включён перевод.
-
-- ASR: локальный `faster-whisper` или Groq Whisper. При HTTP 429 Groq
-  автоматически переключается на локальный faster-whisper.
-- Перевод: любой OpenAI-совместимый `chat/completions` (свой `base_url`, ключ и
-  модель) либо локальный `argostranslate`.
-- TTS: `Kokoro` (без клонирования), `Chatterbox` или `XTTS v2` (клонирование
-  голоса по образцу wav из настроек).
-
-Готовые пресеты во вкладке «Перевод»:
-
-| Пресет | ASR | MT | TTS |
-| --- | --- | --- | --- |
-| Бесплатный со своим голосом | Groq | Argos | Chatterbox (только при CUDA, иначе Kokoro) |
-| Лёгкий (по умолчанию) | faster-whisper | Argos | Kokoro |
-| Офлайн | faster-whisper | Argos | Kokoro |
-| Облако | Groq | OpenAI-совместимый API | Kokoro |
-
-Перед выбором TTS GUI проверяет поддержку целевого языка и показывает
-предупреждение. Если CUDA нет, клонирующие движки не предлагаются по умолчанию:
-на CPU они работают слишком медленно для живого перевода.
-
-Кнопка «Проверить компоненты» запускает `python3 tools/engines/probe.py` и
-показывает, какие пакеты установлены. Движок стартует демоном только при
-`translate_enabled = true`; журнал пишется в `~/.cache/RustMIC/engines/engines.log`.
-Скрипты встроены в бинарник и извлекаются в кэш при первом запуске.
-
 ## Linux: сборка и установка
 
 ```fish
@@ -214,7 +120,7 @@ RustMIC install          # systemd-юнит, enable --now
 
 ### Интерфейс
 
-Окно делится на вкладки «Микрофон», «Саундпад», «Перевод» и «Настройки».
+Окно делится на вкладки «Микрофон», «Саундпад» и «Настройки».
 Вверху — статус службы и меню (журнал, диагностика, перезапуск, выход);
 на вкладке «Микрофон» — состояние соединения, живой индикатор уровня,
 переключатель шумодава, режим и чувствительность гейта (черту порога можно
@@ -224,9 +130,7 @@ RustMIC install          # systemd-юнит, enable --now
 «Запустить» — он не притворяется работающим и не показывает устаревшие
 значения. Закрытие окна сворачивает его в трей; «Выход» в меню/трее
 завершает приложение. Вкладка «Саундпад» полностью рабочая: плитки,
-обложка, пауза/перемотка и громкость музыки. Вкладка «Перевод» управляет
-PCM-микшером, встроенным движком и пресетами (см. ниже). Мониторинг музыки —
-только Linux.
+обложка, пауза/перемотка и громкость музыки. Мониторинг музыки — только Linux.
 
 ## Windows: сборка одного файла
 
@@ -252,16 +156,13 @@ launcher'у. Сборка на самой Windows: `cargo build --release --feat
 | `RustMIC settings` | текущие настройки и пути |
 | `RustMIC ctl state` | состояние демона по локальному сокету (JSON) |
 | `RustMIC ctl mic 80` | громкость микрофона на лету |
-| `RustMIC ctl music 70` | громкость музыки |
+| `RustMIC ctl music 70` | громкость музыки, которая идёт в микрофон |
+| `RustMIC ctl monitor-volume 30` | громкость музыки только у вас в колонках (0 — тишина) |
 | `RustMIC ctl gate-mode voice\|level` | режим гейта |
 | `RustMIC ctl mute` / `unmute` | быстрое выключение микрофона |
 | `RustMIC ctl loudnorm on\|off` | выравнивание громкости (с откатом) |
 | `RustMIC ctl ducking on\|off`, `ctl ducking-db 12` | приглушение музыки при голосе |
 | `RustMIC ctl tile-add "Имя" "запрос"`, `ctl tile-remove <id>` | плитки саундпада |
-| `RustMIC ctl translate on\|off` | включить PCM-микшер перевода |
-| `RustMIC ctl translate-langs ru en` | языки перевода |
-| `RustMIC ctl translate-mode replace\|mix` | заменять голос или смешивать |
-| `RustMIC ctl translate-volume 0..100` | громкость перевода |
 | `RustMIC play <query\|URL>` | включить трек/ссылку в микрофон |
 | `RustMIC ctl play <query\|URL>` | то же через демона (состояние трека в `ctl state`) |
 | `RustMIC ctl pause true\|false`, `ctl seek 10` | пауза/перемотка через mpv IPC |
@@ -276,8 +177,7 @@ launcher'у. Сборка на самой Windows: `cargo build --release --feat
 `--bt-address MAC`, `--adb PATH`, `--device NAME` (Windows),
 `--gate-mode voice|level`, `--gate-voice 0..100`, `--gate-level -60..0`,
 `--mic-volume 0..100`, `--music-volume 0..100`, `--loudnorm`, `--no-ducking`,
-`--no-monitor`, `--no-denoise`, `--stats`, `--translate on|off`,
-`--translate-mode replace|mix`, `--translate-volume 0..100`.
+`--no-monitor`, `--no-denoise`, `--stats`.
 
 Демон и GUI общаются по локальному сокету (`$XDG_RUNTIME_DIR/RustMIC.sock`,
 на Windows — именованный pipe). Формат — JSON Lines с версией протокола;
@@ -289,7 +189,7 @@ launcher'у. Сборка на самой Windows: `cargo build --release --feat
 - Windows: `%APPDATA%\RustMIC\config.toml`
 
 ```toml
-config_version = 4
+config_version = 5
 transport = "wifi"          # usb | wifi | wifi-direct | bluetooth
 host = "192.168.1.50"       # только для Wi-Fi
 bt_address = ""             # только для Bluetooth
@@ -303,28 +203,13 @@ loudnorm = false
 ducking = true
 ducking_db = 12.0
 monitor_music = true
-translate_enabled = false
-translate_from = "ru"
-translate_to = "en"
-translate_mode = "replace"   # replace | mix
-translate_volume = 100
-engine_preset = "light"     # free_voice | light | offline | cloud | custom
-asr_engine = "faster_whisper" # faster_whisper | groq
-mt_engine = "argos"          # openai | argos
-tts_engine = "kokoro"        # kokoro | chatterbox | xtts
-groq_api_key = ""
-groq_model = "whisper-large-v3"
-openai_base_url = "https://api.openai.com/v1"
-openai_api_key = ""
-openai_model = "gpt-4o-mini"
-voice_sample = ""           # wav для клонирования Chatterbox/XTTS
 device = "CABLE Input"      # только Windows
 ```
 
-Файл версионирован (сейчас `config_version = 4`): старые `gate = 0.46` и
+Файл версионирован (сейчас `config_version = 5`): старые `gate = 0.46` и
 `volume = 78` автоматически превращаются в `gate_voice = 46` и
-`mic_volume = 78`, а ключи перевода и движков заполняются значениями по
-умолчанию. Демон перечитывает
+`mic_volume = 78`. Неизвестные ключи (в том числе от удалённых функций)
+игнорируются и исчезают при следующем сохранении. Демон перечитывает
 шумодав, гейт и громкости «на горячую»; смену транспорта GUI применяет
 перезапуском службы.
 
