@@ -1,6 +1,6 @@
 [package]
 name = "RustMIC"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "WO Mic (Android) as a system microphone on Linux and Windows, with RNNoise denoise"
 
