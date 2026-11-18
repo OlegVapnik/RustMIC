@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Bump whenever the meaning of a key changes. Older files are upgraded on load.
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
 
 /// PipeWire null sink fed by `pacat` (Linux).
 pub const SINK: &str = "rustmic_sink";
@@ -53,6 +53,33 @@ impl GateMode {
     }
 }
 
+/// How the daemon combines your voice with audio from the external translator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranslateMode {
+    /// Mute the original voice while translated speech is playing.
+    #[default]
+    Replace,
+    /// Play both sources together.
+    Mix,
+}
+
+impl TranslateMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Mix => "mix",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.trim().trim_matches('"').to_lowercase().as_str() {
+            "mix" | "mixed" | "смешивать" => Self::Mix,
+            _ => Self::Replace,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     /// Schema version read from `config.toml`.
@@ -86,6 +113,16 @@ pub struct Settings {
     pub ducking_db: f32,
     /// Mirror music to the default output (Linux only).
     pub monitor_music: bool,
+    /// Feed voice to / mix translated speech from the local PCM sockets.
+    pub translate_enabled: bool,
+    /// Language code of the spoken language, passed to the translator.
+    pub translate_from: String,
+    /// Target language code, passed to the translator.
+    pub translate_to: String,
+    /// Replace the original voice or mix both sources.
+    pub translate_mode: TranslateMode,
+    /// Translated speech gain 0..100 %.
+    pub translate_volume: u32,
 }
 
 impl Default for Settings {
@@ -108,6 +145,11 @@ impl Default for Settings {
             ducking: true,
             ducking_db: 12.0,
             monitor_music: true,
+            translate_enabled: false,
+            translate_from: "ru".to_string(),
+            translate_to: "en".to_string(),
+            translate_mode: TranslateMode::Replace,
+            translate_volume: 100,
         }
     }
 }
@@ -174,6 +216,21 @@ impl Settings {
                 "ducking" => self.ducking = parse_bool(value, true),
                 "ducking_db" => self.ducking_db = parse_db_amount(value),
                 "monitor_music" => self.monitor_music = parse_bool(value, true),
+                "translate_enabled" | "translate" => {
+                    self.translate_enabled = parse_bool(value, false)
+                }
+                "translate_from" | "translate_from_lang" => {
+                    if !value.is_empty() {
+                        self.translate_from = value.to_string();
+                    }
+                }
+                "translate_to" | "translate_to_lang" => {
+                    if !value.is_empty() {
+                        self.translate_to = value.to_string();
+                    }
+                }
+                "translate_mode" => self.translate_mode = TranslateMode::parse(value),
+                "translate_volume" => self.translate_volume = parse_percent(value),
                 "device" => {
                     if !value.is_empty() {
                         self.device = value.to_string();
@@ -225,6 +282,11 @@ impl Settings {
         text.push_str(&format!("ducking = {}\n", self.ducking));
         text.push_str(&format!("ducking_db = {:.1}\n", self.ducking_db));
         text.push_str(&format!("monitor_music = {}\n", self.monitor_music));
+        text.push_str(&format!("translate_enabled = {}\n", self.translate_enabled));
+        text.push_str(&format!("translate_from = \"{}\"\n", self.translate_from));
+        text.push_str(&format!("translate_to = \"{}\"\n", self.translate_to));
+        text.push_str(&format!("translate_mode = \"{}\"\n", self.translate_mode.as_str()));
+        text.push_str(&format!("translate_volume = {}\n", self.translate_volume));
         if cfg!(windows) {
             text.push_str(&format!("device = \"{}\"\n", self.device));
         }
@@ -403,7 +465,7 @@ pub fn default_adb() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_transport, parse_volume, GateMode, Settings};
+    use super::{normalize_transport, parse_volume, GateMode, Settings, TranslateMode};
 
     #[test]
     fn volume_defaults_to_100_for_missing_or_invalid_values() {
@@ -452,5 +514,19 @@ mod tests {
         assert_eq!(settings.gate_mode, GateMode::Level);
         assert_eq!(settings.gate_voice, 70);
         assert!((settings.gate_level_db + 42.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn translator_settings_are_parsed() {
+        let mut settings = Settings::default();
+        settings.apply(
+            "translate_enabled = true\ntranslate_from = \"ru\"\ntranslate_to = \"de\"\n\
+             translate_mode = mix\ntranslate_volume = 65\n",
+        );
+        assert!(settings.translate_enabled);
+        assert_eq!(settings.translate_from, "ru");
+        assert_eq!(settings.translate_to, "de");
+        assert_eq!(settings.translate_mode, TranslateMode::Mix);
+        assert_eq!(settings.translate_volume, 65);
     }
 }

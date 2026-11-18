@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{GateMode, Settings};
-use crate::{level, music, tiles};
+use crate::{level, mixer, music, tiles};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -96,6 +96,8 @@ pub struct AppState {
     pub audio: AudioState,
     pub track: Option<TrackState>,
     pub tiles: Vec<Tile>,
+    /// External translator / PCM mixer status.
+    pub translate: mixer::TranslateStatus,
     /// ID of the last command this daemon has applied.
     pub last_command_id: u64,
     pub updated_at: u64,
@@ -113,6 +115,7 @@ impl Default for AppState {
             audio: AudioState::from(&Settings::default()),
             track: None,
             tiles: Vec::new(),
+            translate: mixer::status(),
             last_command_id: 0,
             updated_at: 0,
         }
@@ -140,6 +143,7 @@ impl AppState {
             audio: AudioState::from(settings),
             track: None,
             tiles: Vec::new(),
+            translate: mixer::status(),
             last_command_id: 0,
             updated_at: now(),
         }
@@ -158,6 +162,7 @@ impl AppState {
         };
         self.track = music::status();
         self.tiles = tiles::load();
+        self.translate = mixer::status();
         self.updated_at = now();
     }
 }

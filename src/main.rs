@@ -21,10 +21,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustmic_mic::audio::{self, Sink};
-use rustmic_mic::config::{self, GateMode, Settings};
+use rustmic_mic::config::{self, GateMode, Settings, TranslateMode};
 use rustmic_mic::core::{AppState, Command};
 use rustmic_mic::denoise::{Denoiser, Live};
-use rustmic_mic::{adb, ipc, level, logging, music, platform, tiles, STOP};
+use rustmic_mic::{adb, ipc, level, logging, mixer, music, platform, tiles, STOP};
 
 fn install_signals() {
     #[cfg(unix)]
@@ -215,7 +215,11 @@ fn pump(
             continue;
         }
         den.process(&samples, &mut out);
-        sink.write(&out)?;
+        // The translator receives clean voice; whatever it sends back is mixed
+        // into the same PCM stream before it reaches the virtual microphone.
+        mixer::publish_voice(&out);
+        let mixed = mixer::process(&out);
+        sink.write(&mixed)?;
     }
 }
 
@@ -302,6 +306,8 @@ fn run(cfg: Settings, stats: bool) -> i32 {
     level::clear();
     music::configure(&cfg);
     music::start_control();
+    mixer::configure(&cfg);
+    mixer::start_servers();
 
     #[cfg(unix)]
     rustmic_mic::audio::linux::set_source_volume(cfg.mic_volume);
@@ -384,6 +390,23 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                     Command::RemoveTile { tile_id } => {
                         tiles::remove(&tile_id);
                     }
+                    Command::SetTranslate { enabled } => {
+                        settings.translate_enabled = enabled;
+                        save = true;
+                    }
+                    Command::SetTranslateLanguages { from, to } => {
+                        settings.translate_from = from;
+                        settings.translate_to = to;
+                        save = true;
+                    }
+                    Command::SetTranslateMode { mode } => {
+                        settings.translate_mode = mode;
+                        save = true;
+                    }
+                    Command::SetTranslateVolume { value } => {
+                        settings.translate_volume = value.min(100);
+                        save = true;
+                    }
                     Command::Play { query } => {
                         if let Err(error) = music::play(&settings, &query) {
                             log(&format!("play failed: {error}"));
@@ -426,6 +449,7 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                     }
                 }
                 music::configure(&settings);
+                mixer::configure(&settings);
                 update_live(&live, &settings, muted);
                 if let Ok(mut state) = state.write() {
                     state.refresh(&settings);
@@ -512,6 +536,7 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                 let settings = Settings::load();
                 let muted = live.read().map(|live| live.muted).unwrap_or(false);
                 music::configure(&settings);
+                mixer::configure(&settings);
                 update_live(&live, &settings, muted);
                 #[cfg(unix)]
                 rustmic_mic::audio::linux::set_source_volume(settings.mic_volume);
@@ -657,6 +682,25 @@ fn ctl(args: &[String]) -> i32 {
         "tile-remove" => Command::RemoveTile {
             tile_id: value.to_string(),
         },
+        "translate" => Command::SetTranslate {
+            enabled: parse_bool(value),
+        },
+        "translate-mode" => Command::SetTranslateMode {
+            mode: TranslateMode::parse(value),
+        },
+        "translate-volume" => Command::SetTranslateVolume {
+            value: parse_percent(value),
+        },
+        "translate-langs" => {
+            if args.len() < 3 {
+                log("ctl translate-langs: нужен язык источника и язык перевода");
+                return 2;
+            }
+            Command::SetTranslateLanguages {
+                from: value.to_string(),
+                to: args[2].to_string(),
+            }
+        }
         "monitor" => Command::SetMonitor {
             enabled: parse_bool(value),
         },
@@ -802,6 +846,27 @@ fn main() {
             "--no-ducking" => cfg.ducking = false,
             "--monitor" => cfg.monitor_music = true,
             "--no-monitor" => cfg.monitor_music = false,
+            "--translate" => cfg.translate_enabled = true,
+            "--no-translate" => cfg.translate_enabled = false,
+            "--translate-mode" => {
+                if let Some(value) = it.next() {
+                    cfg.translate_mode = TranslateMode::parse(value);
+                }
+            }
+            "--translate-volume" => {
+                if let Some(value) = it.next() {
+                    cfg.translate_volume = parse_percent(value);
+                }
+            }
+            other if other.starts_with("--translate=") => {
+                cfg.translate_enabled = parse_bool(&other[12..]);
+            }
+            other if other.starts_with("--translate-mode=") => {
+                cfg.translate_mode = TranslateMode::parse(&other[17..]);
+            }
+            other if other.starts_with("--translate-volume=") => {
+                cfg.translate_volume = parse_percent(&other[19..]);
+            }
             other if other.starts_with("--gate=") => {
                 cfg.gate_voice = parse_gate_voice(&other[7..]);
             }
@@ -865,6 +930,14 @@ fn main() {
             println!("loudnorm: {}", cfg.loudnorm);
             println!("ducking: {} ({:.1} dB)", cfg.ducking, cfg.ducking_db);
             println!("monitor_music: {}", cfg.monitor_music);
+            println!(
+                "translate: {} ({} -> {}, {}, {}%)",
+                cfg.translate_enabled,
+                cfg.translate_from,
+                cfg.translate_to,
+                cfg.translate_mode.as_str(),
+                cfg.translate_volume
+            );
             if cfg!(windows) {
                 println!("device: {}", cfg.device);
             }
@@ -932,10 +1005,13 @@ fn main() {
                  \x20             [--gate-mode voice|level] [--gate-voice 0..100] [--gate-level -60..0]\n\
                  \x20             [--mic-volume 0..100] [--music-volume 0..100] [--loudnorm]\n\
                  \x20             [--no-ducking] [--no-monitor] [--no-denoise] [--stats]\n\
+                 \x20             [--translate on|off] [--translate-mode replace|mix] [--translate-volume 0..100]\n\
                  \x20 RustMIC status | settings\n\
                  \x20 RustMIC ctl state | mic N | music N | gate-mode voice|level | gate-voice N\n\
                  \x20             | gate-level -45 | denoise on|off | mute | unmute | play ...\n\
                  \x20             | stop-music | pause | seek N | start | stop-service | restart\n\
+                 \x20             | translate on|off | translate-mode replace|mix | translate-volume N\n\
+                 \x20             | translate-langs ru en\n\
                  \x20 RustMIC play <название или URL>   (песня сразу в микрофон, без скачивания)\n\
                  \x20 RustMIC stop-music | now-playing\n\
                  \x20 RustMIC filter [--gate-voice N] [--no-denoise]   (stdin -> stdout, для проверки)\n\

@@ -24,7 +24,7 @@ use eframe::egui::{
     RichText, Sense, Stroke, TextStyle, Theme, ThemePreference, Vec2,
 };
 
-use crate::config::{self, GateMode, Settings};
+use crate::config::{self, GateMode, Settings, TranslateMode};
 use crate::core::{AppState, Levels};
 use crate::{audio, ipc, platform};
 
@@ -880,46 +880,145 @@ impl App {
     // ------------------------------------------------------------ translation
 
     fn tab_translate(&mut self, ui: &mut egui::Ui) {
-        card(ui, "Голосовой перевод", |ui| {
-            ui.label(
-                RichText::new("Появится на шаге 5").size(17.0).family(semibold()),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                "Схема: микрофон → распознавание речи → перевод → синтез → общий PCM-микшер \
-                 в демоне. Для этого сначала нужен микшер музыки и голоса (шаг 3).",
-            );
-            ui.add_space(12.0);
-            egui::Grid::new("translate-pipeline")
-                .num_columns(4)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    for (index, step) in ["Слушаю", "Распознаю", "Перевожу", "Говорю"]
-                        .iter()
-                        .enumerate()
-                    {
-                        ui.label(small(format!("{}. {step}", index + 1)));
-                    }
-                });
-            ui.add_space(12.0);
-            ui.add_enabled(false, egui::Button::new("Запустить перевод"));
+        let status = self.state.translate.clone();
+        let online = self.service_running();
+
+        card(ui, "Внешний переводчик", |ui| {
+            let mut enabled = self.settings.translate_enabled;
+            if ui.checkbox(&mut enabled, "Использовать перевод").changed() {
+                self.settings.translate_enabled = enabled;
+                self.send(crate::core::Command::SetTranslate { enabled });
+            }
+            ui.label(small(
+                "Демон отдаёт чистый голос переводчику и смешивает его ответ обратно \
+                 в микрофон. Сам движок перевода запускается отдельно — RustMIC only \
+                 provides the PCM plumbing.",
+            ));
+            if status.active {
+                ui.colored_label(ACCENT, "● Переводчик говорит прямо сейчас");
+            } else {
+                ui.label(small("● Переводчик молчит"));
+            }
         });
 
         ui.add_space(12.0);
-        card(ui, "Языки", |ui| {
-            ui.add_enabled_ui(false, |ui| {
-                egui::ComboBox::from_label("С моего языка")
-                    .selected_text("Русский")
-                    .show_ui(ui, |ui| {
-                        ui.label("Русский");
+        card(ui, "Языки и режим", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("С языка");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.settings.translate_from)
+                            .hint_text("ru")
+                            .desired_width(70.0),
+                    )
+                    .changed()
+                {
+                    self.send(crate::core::Command::SetTranslateLanguages {
+                        from: self.settings.translate_from.clone(),
+                        to: self.settings.translate_to.clone(),
                     });
-                egui::ComboBox::from_label("На язык собеседника")
-                    .selected_text("English")
-                    .show_ui(ui, |ui| {
-                        ui.label("English");
+                }
+                ui.label("→");
+                ui.label("На язык");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.settings.translate_to)
+                            .hint_text("en")
+                            .desired_width(70.0),
+                    )
+                    .changed()
+                {
+                    self.send(crate::core::Command::SetTranslateLanguages {
+                        from: self.settings.translate_from.clone(),
+                        to: self.settings.translate_to.clone(),
                     });
+                }
             });
-            ui.label(small("Настройки сохраним, когда появится движок перевода."));
+            ui.add_space(6.0);
+            let mode_label = match self.settings.translate_mode {
+                TranslateMode::Replace => "Заменять голос",
+                TranslateMode::Mix => "Смешивать с голосом",
+            };
+            egui::ComboBox::from_label("Режим")
+                .selected_text(mode_label)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_value(
+                            &mut self.settings.translate_mode,
+                            TranslateMode::Replace,
+                            "Заменять голос",
+                        )
+                        .clicked()
+                    {
+                        self.send(crate::core::Command::SetTranslateMode {
+                            mode: TranslateMode::Replace,
+                        });
+                    }
+                    if ui
+                        .selectable_value(
+                            &mut self.settings.translate_mode,
+                            TranslateMode::Mix,
+                            "Смешивать с голосом",
+                        )
+                        .clicked()
+                    {
+                        self.send(crate::core::Command::SetTranslateMode {
+                            mode: TranslateMode::Mix,
+                        });
+                    }
+                });
+            ui.add_space(6.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.settings.translate_volume, 0..=100)
+                        .text("Громкость перевода"),
+                )
+                .changed()
+            {
+                self.send(crate::core::Command::SetTranslateVolume {
+                    value: self.settings.translate_volume,
+                });
+            }
+            ui.label(small(
+                "В режиме «Заменять голос» ваш голос заглушается, пока переводчик говорит.",
+            ));
+        });
+
+        ui.add_space(12.0);
+        card(ui, "Потоки PCM", |ui| {
+            kv(
+                ui,
+                "Голос → переводчик",
+                if status.voice_connected {
+                    "подключён"
+                } else {
+                    "ожидание подключения"
+                },
+            );
+            kv(
+                ui,
+                "Перевод → микрофон",
+                if status.translate_connected {
+                    "подключён"
+                } else {
+                    "ожидание подключения"
+                },
+            );
+            kv(
+                ui,
+                "Уровень перевода",
+                &format!("{:.0} дБ", status.level_db),
+            );
+            let (voice, translated) = crate::mixer::endpoints();
+            ui.add_space(6.0);
+            ui.label(small(format!("Читать голос: {voice}")));
+            ui.label(small(format!("Писать перевод: {translated}")));
+            ui.label(small("Формат: s16le, 48 kHz, mono."));
+            if !online {
+                ui.label(small(
+                    "Служба не запущена — локальные потоки появятся после её запуска.",
+                ));
+            }
         });
     }
 

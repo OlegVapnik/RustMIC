@@ -23,6 +23,8 @@ YouTube / YouTube Music / SoundCloud и смешивает звук в тот ж
 - **USB** через `adb`: классический режим WO Mic.
 - **Шумодав** RNNoise + гейт по VAD или по уровню (RMS, дБ), громкость 0–100 %.
 - **Музыка в микрофон**: name → `ytsearch1:<name>`, ссылки Passing-through.
+- **Голосовой перевод**: общий PCM-микшер в демоне + локальные потоки для
+  внешнего движка STT/перевода/TTS (Linux и Windows).
 - **Linux**: PipeWire null-sink → `module-remap-source` → `rustmic_mic`.
 - **Windows**: WASAPI → VB-CABLE, приложения выбирают **CABLE Output**.
 - **Один файл на Windows**: `RustMIC-portable.exe` распаковывается,
@@ -90,8 +92,9 @@ RustMIC stop-music
 На вкладке «Настройки» доступны громкость музыки, `loudnorm` (через
 `lavfi`, с откатом на обычную громкость, если фильтр недоступен), ducking
 громкости музыки при открытом голосовом гейте и мониторинг в наушники
-(только Linux; на Windows мониторинг отключён, пока не появится общий
-PCM-микшер).
+(только Linux; на Windows мониторинг отключён — музыка и голос идут в одно
+устройство CABLE Input, и для раздельного мониторинга нужен отдельный PCM-микшер
+на стороне Windows).
 
 На Linux звук идёт в отдельный `rustmic_music` null-sink и двумя лупбеками
 смешивается в `rustmic_sink` (микрофон) и в обычный выход (наушники).
@@ -101,6 +104,38 @@ PCM-микшер).
 воспроизводится поток, а не экран. Задержка ≈20–40 мс. Наушники обязательны,
 иначе микрофон подхватит звук из колонок. В Discord/OBS выключите Krisp/шумодав,
 иначе он может вырезать музыку как «фоновый шум».
+
+## Голосовой перевод (PCM-микшер)
+
+Демон умеет отдавать очищенный голос внешнему переводчику и смешивать его
+синтезированную речь обратно в тот же виртуальный микрофон. Никакого облака
+внутри нет: подключается любой движок, который умеет читать/писать PCM
+(`s16le`, 48 кГц, моно).
+
+Потоки создаются при запуске службы:
+
+- Linux: `~/.cache/RustMIC/RustMIC-voice.sock` (читать голос),
+  `~/.cache/RustMIC/RustMIC-translate.sock` (писать перевод), права `0600`;
+- Windows: `\\.\pipe\RustMIC-voice` и `\\.\pipe\RustMIC-translate`
+  (именованные pipe текущего пользователя).
+
+Вкладка «Перевод» включает микшер, задаёт языки (`ru → en` по умолчанию),
+режим («Заменять голос» — оригинал заглушается, пока говорит переводчик,
+или «Смешивать») и громкость перевода. Там же видно, подключён ли переводчик
+к каждому потоку и уровень приходящей речи.
+
+Из консоли:
+
+```fish
+RustMIC ctl translate on
+RustMIC ctl translate-langs ru en
+RustMIC ctl translate-mode replace   # или mix
+RustMIC ctl translate-volume 100
+```
+
+Микшер буферизует не более секунды перевода: при задержке движка старые
+сэмплы отбрасываются, чтобы не копить задержку. Пока переводчик говорит,
+в его входной поток уходит тишина — это защищает от самовозбуждения.
 
 ## Linux: сборка и установка
 
@@ -129,8 +164,8 @@ RustMIC install          # systemd-юнит, enable --now
 «Запустить» — он не притворяется работающим и не показывает устаревшие
 значения. Закрытие окна сворачивает его в трей; «Выход» в меню/трее
 завершает приложение. Вкладка «Саундпад» полностью рабочая: плитки,
-обложка, пауза/перемотка и громкость музыки. «Перевод» пока заготовка
-под общий PCM-микшер (следующий шаг). Мониторинг музыки — только Linux.
+обложка, пауза/перемотка и громкость музыки. Вкладка «Перевод» управляет
+PCM-микшером и внешними потоками (см. ниже). Мониторинг музыки — только Linux.
 
 ## Windows: сборка одного файла
 
@@ -162,6 +197,10 @@ launcher'у. Сборка на самой Windows: `cargo build --release --feat
 | `RustMIC ctl loudnorm on\|off` | выравнивание громкости (с откатом) |
 | `RustMIC ctl ducking on\|off`, `ctl ducking-db 12` | приглушение музыки при голосе |
 | `RustMIC ctl tile-add "Имя" "запрос"`, `ctl tile-remove <id>` | плитки саундпада |
+| `RustMIC ctl translate on\|off` | включить PCM-микшер перевода |
+| `RustMIC ctl translate-langs ru en` | языки перевода |
+| `RustMIC ctl translate-mode replace\|mix` | заменять голос или смешивать |
+| `RustMIC ctl translate-volume 0..100` | громкость перевода |
 | `RustMIC play <query\|URL>` | включить трек/ссылку в микрофон |
 | `RustMIC ctl play <query\|URL>` | то же через демона (состояние трека в `ctl state`) |
 | `RustMIC ctl pause true\|false`, `ctl seek 10` | пауза/перемотка через mpv IPC |
@@ -176,7 +215,8 @@ launcher'у. Сборка на самой Windows: `cargo build --release --feat
 `--bt-address MAC`, `--adb PATH`, `--device NAME` (Windows),
 `--gate-mode voice|level`, `--gate-voice 0..100`, `--gate-level -60..0`,
 `--mic-volume 0..100`, `--music-volume 0..100`, `--loudnorm`, `--no-ducking`,
-`--no-monitor`, `--no-denoise`, `--stats`.
+`--no-monitor`, `--no-denoise`, `--stats`, `--translate on|off`,
+`--translate-mode replace|mix`, `--translate-volume 0..100`.
 
 Демон и GUI общаются по локальному сокету (`$XDG_RUNTIME_DIR/RustMIC.sock`,
 на Windows — именованный pipe). Формат — JSON Lines с версией протокола;
@@ -188,6 +228,7 @@ launcher'у. Сборка на самой Windows: `cargo build --release --feat
 - Windows: `%APPDATA%\RustMIC\config.toml`
 
 ```toml
+config_version = 3
 transport = "wifi"          # usb | wifi | wifi-direct | bluetooth
 host = "192.168.1.50"       # только для Wi-Fi
 bt_address = ""             # только для Bluetooth
@@ -201,11 +242,18 @@ loudnorm = false
 ducking = true
 ducking_db = 12.0
 monitor_music = true
+translate_enabled = false
+translate_from = "ru"
+translate_to = "en"
+translate_mode = "replace"   # replace | mix
+translate_volume = 100
 device = "CABLE Input"      # только Windows
 ```
 
-Файл версионирован: старые `gate = 0.46` и `volume = 78` автоматически
-превращаются в `gate_voice = 46` и `mic_volume = 78`. Демон перечитывает
+Файл версионирован (сейчас `config_version = 3`): старые `gate = 0.46` и
+`volume = 78` автоматически превращаются в `gate_voice = 46` и
+`mic_volume = 78`, а ключи перевода заполняются значениями по умолчанию.
+Демон перечитывает
 шумодав, гейт и громкости «на горячую»; смену транспорта GUI применяет
 перезапуском службы.
 

@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::GateMode;
+use crate::config::{GateMode, TranslateMode};
 
 pub use super::state::PROTOCOL_VERSION;
 
@@ -32,6 +32,10 @@ pub enum Command {
     StopMusic,
     AddTile { title: String, query: String },
     RemoveTile { tile_id: String },
+    SetTranslate { enabled: bool },
+    SetTranslateLanguages { from: String, to: String },
+    SetTranslateMode { mode: TranslateMode },
+    SetTranslateVolume { value: u32 },
     Pause { paused: bool },
     Seek { seconds: f64 },
     Restart,
@@ -59,6 +63,10 @@ impl Command {
             Self::StopMusic => "stop_music",
             Self::AddTile { .. } => "add_tile",
             Self::RemoveTile { .. } => "remove_tile",
+            Self::SetTranslate { .. } => "set_translate",
+            Self::SetTranslateLanguages { .. } => "set_translate_languages",
+            Self::SetTranslateMode { .. } => "set_translate_mode",
+            Self::SetTranslateVolume { .. } => "set_translate_volume",
             Self::Pause { .. } => "pause",
             Self::Seek { .. } => "seek",
             Self::Restart => "restart",
@@ -153,6 +161,21 @@ mod tests {
         assert_eq!(text.matches("\"id\"").count(), 1, "{text}");
         let back: CommandMessage = serde_json::from_str(&text).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn translate_commands_roundtrip() {
+        let message = CommandMessage::new(Command::SetTranslateMode {
+            mode: TranslateMode::Mix,
+        });
+        let text = serde_json::to_string(&message).unwrap();
+        let back: CommandMessage = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            back.command,
+            Command::SetTranslateMode {
+                mode: TranslateMode::Mix
+            }
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod gui;
 pub mod ipc;
 pub mod level;
 pub mod logging;
+pub mod mixer;
 pub mod music;
 pub mod platform;
 pub mod tiles;
