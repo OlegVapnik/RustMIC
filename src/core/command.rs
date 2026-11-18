@@ -8,7 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{GateMode, TranslateMode};
+use crate::config::{
+    AsrEngine, EnginePreset, GateMode, MtEngine, TranslateMode, TtsEngine,
+};
 
 pub use super::state::PROTOCOL_VERSION;
 
@@ -36,6 +38,19 @@ pub enum Command {
     SetTranslateLanguages { from: String, to: String },
     SetTranslateMode { mode: TranslateMode },
     SetTranslateVolume { value: u32 },
+    /// Persist the built-in translator engine selection in one transaction.
+    SetEngines {
+        preset: EnginePreset,
+        asr: AsrEngine,
+        mt: MtEngine,
+        tts: TtsEngine,
+        groq_key: String,
+        groq_model: String,
+        openai_base: String,
+        openai_key: String,
+        openai_model: String,
+        voice_sample: String,
+    },
     Pause { paused: bool },
     Seek { seconds: f64 },
     Restart,
@@ -67,6 +82,7 @@ impl Command {
             Self::SetTranslateLanguages { .. } => "set_translate_languages",
             Self::SetTranslateMode { .. } => "set_translate_mode",
             Self::SetTranslateVolume { .. } => "set_translate_volume",
+            Self::SetEngines { .. } => "set_engines",
             Self::Pause { .. } => "pause",
             Self::Seek { .. } => "seek",
             Self::Restart => "restart",
@@ -147,6 +163,29 @@ mod tests {
                 query: "https://youtu.be/abc".to_string()
             }
         );
+    }
+
+    #[test]
+    fn engine_settings_roundtrip_without_id_clash() {
+        let message = CommandMessage::with_id(
+            7,
+            Command::SetEngines {
+                preset: EnginePreset::FreeVoice,
+                asr: AsrEngine::Groq,
+                mt: MtEngine::Argos,
+                tts: TtsEngine::Chatterbox,
+                groq_key: "key".to_string(),
+                groq_model: "whisper-large-v3".to_string(),
+                openai_base: "https://api.openai.com/v1".to_string(),
+                openai_key: String::new(),
+                openai_model: "gpt-4o-mini".to_string(),
+                voice_sample: "/tmp/voice.wav".to_string(),
+            },
+        );
+        let text = serde_json::to_string(&message).unwrap();
+        assert_eq!(text.matches("\"id\"").count(), 1, "{text}");
+        let back: CommandMessage = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, message);
     }
 
     #[test]

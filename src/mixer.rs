@@ -6,15 +6,21 @@
 //! * `RustMIC-voice`  — the daemon publishes denoised voice here (read it);
 //! * `RustMIC-translate` — the translator writes synthesised speech here.
 //!
-//! Linux uses Unix sockets in the cache dir (mode 0600); Windows uses
-//! per-user named pipes. No cloud service is baked in: any STT/translation/TTS
-//! pipeline that speaks this tiny protocol can be plugged in.
+//! `publish_voice()` is called in the audio pump **before** `process()` mixes
+//! the translation in, so the translator never hears its own output. The queue
+//! is bounded to one second and drops the oldest samples on overflow; an empty
+//! queue produces digital silence instead of repeating the last chunk.
+//!
+//! Linux uses Unix sockets in the cache dir (mode 0600); Windows uses named
+//! pipes created with `PIPE_REJECT_REMOTE_CLIENTS` and a DACL that grants
+//! access to the current user only. No cloud service is baked in: any
+//! STT/translation/TTS pipeline that speaks this tiny protocol can be plugged in.
 
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::fs;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
@@ -25,6 +31,12 @@ use interprocess::local_socket::GenericFilePath;
 #[cfg(windows)]
 use interprocess::local_socket::GenericNamespaced;
 use interprocess::local_socket::prelude::*;
+#[cfg(windows)]
+use interprocess::os::windows::local_socket::ListenerOptionsExt;
+#[cfg(windows)]
+use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+#[cfg(windows)]
+use widestring::U16CString;
 use interprocess::local_socket::{Listener, ListenerOptions, Stream};
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +57,7 @@ struct MixConfig {
     enabled: bool,
     mode: TranslateMode,
     volume: u32,
+    duck_db: f32,
 }
 
 static CONFIG: OnceLock<RwLock<MixConfig>> = OnceLock::new();
@@ -62,6 +75,8 @@ struct Translate {
     connected: AtomicBool,
     level_bits: AtomicU32,
     active: AtomicBool,
+    dropped_samples: AtomicU64,
+    underruns: AtomicU64,
 }
 
 static TRANSLATE: OnceLock<Translate> = OnceLock::new();
@@ -80,6 +95,12 @@ pub struct TranslateStatus {
     pub volume: u32,
     pub from: String,
     pub to: String,
+    /// How much translated audio is buffered right now (0..=1000 ms).
+    pub queued_ms: u32,
+    /// Samples discarded because the translator got ahead of the microphone.
+    pub dropped_samples: u64,
+    /// Samples replaced with silence because the translator was behind.
+    pub underruns: u64,
 }
 
 fn config() -> &'static RwLock<MixConfig> {
@@ -93,6 +114,8 @@ fn translate() -> &'static Translate {
         connected: AtomicBool::new(false),
         level_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
         active: AtomicBool::new(false),
+        dropped_samples: AtomicU64::new(0),
+        underruns: AtomicU64::new(0),
     })
 }
 
@@ -102,6 +125,7 @@ pub fn configure(settings: &Settings) {
         enabled: settings.translate_enabled,
         mode: settings.translate_mode,
         volume: settings.translate_volume.min(100),
+        duck_db: settings.ducking_db,
     };
     if let Ok(mut current) = config().write() {
         *current = next;
@@ -134,9 +158,54 @@ fn make_listener(path: &std::path::Path) -> io::Result<Listener> {
 }
 
 #[cfg(windows)]
+fn current_user_security_descriptor() -> io::Result<SecurityDescriptor> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut size = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
+        let mut buffer = vec![0u8; size as usize];
+        if GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), size, &mut size) == 0 {
+            CloseHandle(token);
+            return Err(io::Error::last_os_error());
+        }
+        CloseHandle(token);
+
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut sid: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut sid) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut len = 0usize;
+        while *sid.add(len) != 0 {
+            len += 1;
+        }
+        let sid_text = String::from_utf16_lossy(std::slice::from_raw_parts(sid, len));
+        LocalFree(sid.cast());
+
+        let sddl = format!("O:{sid_text}G:{sid_text}D:P(A;;GA;;;{sid_text})");
+        let wide = U16CString::from_str(&sddl)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        SecurityDescriptor::deserialize(wide.as_ucstr())
+    }
+}
+
+#[cfg(windows)]
 fn make_listener(pipe: &str) -> io::Result<Listener> {
     let name = pipe.to_ns_name::<GenericNamespaced>()?;
-    ListenerOptions::new().name(name).create_sync()
+    // ListenerOptions defaults to accept_remote = false, which makes
+    // interprocess pass PIPE_REJECT_REMOTE_CLIENTS to CreateNamedPipeW.
+    ListenerOptions::new()
+        .name(name)
+        .security_descriptor(current_user_security_descriptor()?)
+        .create_sync()
 }
 
 /// Human-readable endpoints for the settings tab and README.
@@ -300,8 +369,12 @@ fn read_translated(mut stream: Stream) {
         for pair in bytes.chunks_exact(2) {
             samples.push_back(i16::from_le_bytes([pair[0], pair[1]]));
         }
-        while samples.len() > MAX_BUFFER_SAMPLES {
+        let excess = samples.len().saturating_sub(MAX_BUFFER_SAMPLES);
+        for _ in 0..excess {
             samples.pop_front();
+        }
+        if excess > 0 {
+            state.dropped_samples.fetch_add(excess as u64, Ordering::Relaxed);
         }
     }
     if state.clients.fetch_sub(1, Ordering::SeqCst) <= 1 {
@@ -318,9 +391,18 @@ fn take(count: usize) -> Vec<i16> {
         Err(poisoned) => poisoned.into_inner(),
     };
     let mut output = Vec::with_capacity(count);
+    let mut silent = 0u64;
     for _ in 0..count {
-        output.push(queue.pop_front().unwrap_or(0));
+        match queue.pop_front() {
+            Some(sample) => output.push(sample),
+            None => {
+                // Underrun: insert digital silence, never repeat the last chunk.
+                output.push(0);
+                silent += 1;
+            }
+        }
     }
+    state.underruns.fetch_add(silent, Ordering::Relaxed);
     let sum: f64 = output.iter().map(|sample| *sample as f64).map(|s| s * s).sum();
     let rms = if output.is_empty() {
         f32::NEG_INFINITY
@@ -361,22 +443,41 @@ pub fn publish_voice(samples: &[i16]) {
     let _ = voice.tx.try_send(bytes);
 }
 
-fn scale(sample: i16, gain: f32) -> i16 {
-    ((sample as f32 * gain).round() as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+fn gain_from_db(db: f32) -> f32 {
+    10f32.powf(-db / 20.0)
 }
 
-fn add(left: i16, right: i16) -> i16 {
-    (left as i32 + right as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+/// Cubic soft clipper: unity for small signals, approaches +/-1 smoothly,
+/// and saturates only beyond full scale. Mix mode uses this instead of a hard
+/// clamp so translation on top of voice does not crackle.
+fn soft_clip(x: f32) -> f32 {
+    // tanh is a smooth limiter: nearly transparent for small signals and
+    // asymptotically bounded by +/-1, so summing two full-scale voices never
+    // hard-clips into crackling distortion.
+    x.tanh()
+}
+
+fn mix_sample(voice: i16, translated: i16, gain: f32, duck: f32) -> i16 {
+    let voice = voice as f32 * duck / 32768.0;
+    let translated = translated as f32 * gain / 32768.0;
+    let value = (soft_clip(voice + translated) * 32767.0).round();
+    value.clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 /// Mix one frame of voice with whatever translated audio has arrived.
+///
+/// * `replace`: while translation is active the original voice is ducked by
+///   `ducking_db`; between phrases it passes through untouched.
+/// * `mix`: the original stays at full level and translation is added on top
+///   through the soft clipper.
+///
 /// Translation disabled is a fast path returning the untouched voice.
 pub fn process(voice: &[i16]) -> Vec<i16> {
-    let (enabled, mode, volume) = match config().read() {
-        Ok(config) => (config.enabled, config.mode, config.volume),
+    let (enabled, mode, volume, duck_db) = match config().read() {
+        Ok(config) => (config.enabled, config.mode, config.volume, config.duck_db),
         Err(poisoned) => {
             let config = poisoned.into_inner();
-            (config.enabled, config.mode, config.volume)
+            (config.enabled, config.mode, config.volume, config.duck_db)
         }
     };
     if !enabled {
@@ -384,18 +485,21 @@ pub fn process(voice: &[i16]) -> Vec<i16> {
     }
     let translated = take(voice.len());
     let gain = volume as f32 / 100.0;
+    let duck = if translate().active.load(Ordering::SeqCst) {
+        gain_from_db(duck_db)
+    } else {
+        1.0
+    };
     match mode {
-        TranslateMode::Replace => {
-            if translate().active.load(Ordering::SeqCst) {
-                translated.iter().map(|sample| scale(*sample, gain)).collect()
-            } else {
-                voice.to_vec()
-            }
-        }
+        TranslateMode::Replace => voice
+            .iter()
+            .zip(translated.iter())
+            .map(|(voice, translated)| mix_sample(*voice, *translated, gain, duck))
+            .collect(),
         TranslateMode::Mix => voice
             .iter()
             .zip(translated.iter())
-            .map(|(voice, translated)| add(*voice, scale(*translated, gain)))
+            .map(|(voice, translated)| mix_sample(*voice, *translated, gain, 1.0))
             .collect(),
     }
 }
@@ -410,6 +514,11 @@ pub fn status() -> TranslateStatus {
     };
     let settings = Settings::load();
     let state = translate();
+    let queued = state
+        .samples
+        .lock()
+        .map(|samples| samples.len())
+        .unwrap_or(0);
     let level_db = f32::from_bits(state.level_bits.load(Ordering::SeqCst));
     TranslateStatus {
         enabled,
@@ -425,6 +534,9 @@ pub fn status() -> TranslateStatus {
         volume,
         from: settings.translate_from,
         to: settings.translate_to,
+        queued_ms: ((queued as u32) * 1000 / MAX_BUFFER_SAMPLES as u32).min(1000),
+        dropped_samples: state.dropped_samples.load(Ordering::Relaxed),
+        underruns: state.underruns.load(Ordering::Relaxed),
     }
 }
 
@@ -439,15 +551,27 @@ mod tests {
             enabled: false,
             mode: TranslateMode::Replace,
             volume: 100,
+            duck_db: 12.0,
         };
         assert_eq!(process(&[1, 2, 3]), vec![1, 2, 3]);
     }
 
     #[test]
-    fn scale_and_add_are_saturating() {
-        assert_eq!(scale(100, 0.5), 50);
-        assert_eq!(add(i16::MAX, 100), i16::MAX);
-        assert_eq!(add(i16::MIN, -100), i16::MIN);
+    fn soft_clip_stays_within_full_scale() {
+        assert!((soft_clip(0.25) - 0.25).abs() < 0.02);
+        assert!(soft_clip(1.0) > 0.7 && soft_clip(1.0) < 1.0);
+        assert!(soft_clip(2.0) <= 1.0);
+        assert!(soft_clip(-2.0) >= -1.0);
+        let peak = mix_sample(i16::MAX, i16::MAX, 1.0, 1.0);
+        let trough = mix_sample(i16::MIN, i16::MIN, 1.0, 1.0);
+        assert!(peak > 30000 && peak <= i16::MAX);
+        assert!(trough < -30000 && trough >= i16::MIN);
+    }
+
+    #[test]
+    fn duck_gain_matches_decibels() {
+        assert!((gain_from_db(0.0) - 1.0).abs() < 0.0001);
+        assert!((gain_from_db(12.0) - 0.2512).abs() < 0.001);
     }
 
     #[test]

@@ -24,9 +24,13 @@ use eframe::egui::{
     RichText, Sense, Stroke, TextStyle, Theme, ThemePreference, Vec2,
 };
 
-use crate::config::{self, GateMode, Settings, TranslateMode};
+use crate::config::{
+    self, AsrEngine, EnginePreset, GateMode, MtEngine, Settings, TranslateMode,
+    TtsEngine,
+};
 use crate::core::{AppState, Levels};
-use crate::{audio, ipc, platform};
+use crate::engines::EngineProbe;
+use crate::{audio, engines, ipc, platform};
 
 use tray::{TrayCommand, TrayHandle, TrayStatus};
 
@@ -64,6 +68,7 @@ enum UiEvent {
     Offline(String),
     DefaultMic(bool),
     Diagnostics(String),
+    Probe(EngineProbe),
     Notice(String),
 }
 
@@ -104,6 +109,8 @@ struct App {
     tile_title: String,
     tile_query: String,
     diagnostics: Option<String>,
+    engine_probe: EngineProbe,
+    probe_busy: bool,
     notice: Option<(String, Instant)>,
     busy_since: Option<Instant>,
     hidden: bool,
@@ -132,6 +139,7 @@ impl App {
         spawn_state_reader(event_tx.clone());
         spawn_command_worker(command_rx, event_tx.clone());
         spawn_system_poller(event_tx.clone());
+        spawn_probe_worker(event_tx.clone());
 
         let (tray_tx, tray_commands) = channel::<TrayCommand>();
         let tray = match tray::spawn(tray_tx) {
@@ -164,6 +172,8 @@ impl App {
             tile_title: String::new(),
             tile_query: String::new(),
             diagnostics: None,
+            engine_probe: EngineProbe::default(),
+            probe_busy: true,
             notice: None,
             busy_since: None,
             hidden: false,
@@ -238,6 +248,24 @@ impl App {
         });
     }
 
+    fn save_engines(&mut self) {
+        let s = &self.settings;
+        let command = crate::core::Command::SetEngines {
+            preset: s.engine_preset,
+            asr: s.asr_engine,
+            mt: s.mt_engine,
+            tts: s.tts_engine,
+            groq_key: s.groq_api_key.clone(),
+            groq_model: s.groq_model.clone(),
+            openai_base: s.openai_base_url.clone(),
+            openai_key: s.openai_api_key.clone(),
+            openai_model: s.openai_model.clone(),
+            voice_sample: s.voice_sample.clone(),
+        };
+        self.send(command);
+        self.notify("Настройки движков сохранены".into());
+    }
+
     fn play(&mut self, query: String) {
         if query.trim().is_empty() {
             return;
@@ -279,6 +307,10 @@ impl App {
                 }
                 UiEvent::DefaultMic(value) => self.default_mic = value,
                 UiEvent::Diagnostics(text) => self.diagnostics = Some(text),
+                UiEvent::Probe(result) => {
+                    self.probe_busy = false;
+                    self.engine_probe = result;
+                }
                 UiEvent::Notice(text) => self.notify(text),
             }
         }
@@ -891,8 +923,8 @@ impl App {
             }
             ui.label(small(
                 "Демон отдаёт чистый голос переводчику и смешивает его ответ обратно \
-                 в микрофон. Сам движок перевода запускается отдельно — RustMIC only \
-                 provides the PCM plumbing.",
+                 в микрофон. Встроенный движок на Python можно включить ниже; любой \
+                 внешний переводчик тоже работает через те же PCM-потоки.",
             ));
             if status.active {
                 ui.colored_label(ACCENT, "● Переводчик говорит прямо сейчас");
@@ -982,6 +1014,227 @@ impl App {
             ui.label(small(
                 "В режиме «Заменять голос» ваш голос заглушается, пока переводчик говорит.",
             ));
+        });
+
+        ui.add_space(12.0);
+        card(ui, "Движки перевода", |ui| {
+            let cuda = self.engine_probe.cuda;
+            egui::ComboBox::from_label("Пресет")
+                .selected_text(self.settings.engine_preset.label())
+                .show_ui(ui, |ui| {
+                    for &preset in EnginePreset::ALL {
+                        if ui
+                            .selectable_value(
+                                &mut self.settings.engine_preset,
+                                preset,
+                                preset.label(),
+                            )
+                            .clicked()
+                            && preset != EnginePreset::Custom
+                        {
+                            let (asr, mt, tts) = engines::preset_engines(preset, cuda);
+                            self.settings.asr_engine = asr;
+                            self.settings.mt_engine = mt;
+                            self.settings.tts_engine = tts;
+                        }
+                    }
+                });
+            ui.label(small(engines::preset_hint(
+                self.settings.engine_preset,
+                &self.engine_probe,
+            )));
+
+            ui.add_space(6.0);
+            egui::ComboBox::from_label("Распознавание")
+                .selected_text(self.settings.asr_engine.as_str())
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_value(
+                            &mut self.settings.asr_engine,
+                            AsrEngine::FasterWhisper,
+                            "faster-whisper (локально)",
+                        )
+                        .clicked()
+                    {
+                        self.settings.engine_preset = EnginePreset::Custom;
+                    }
+                    if ui
+                        .selectable_value(
+                            &mut self.settings.asr_engine,
+                            AsrEngine::Groq,
+                            "Groq Whisper (облако)",
+                        )
+                        .clicked()
+                    {
+                        self.settings.engine_preset = EnginePreset::Custom;
+                    }
+                });
+            egui::ComboBox::from_label("Перевод")
+                .selected_text(self.settings.mt_engine.as_str())
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_value(&mut self.settings.mt_engine, MtEngine::OpenAi, "OpenAI-совместимый API")
+                        .clicked()
+                    {
+                        self.settings.engine_preset = EnginePreset::Custom;
+                    }
+                    if ui
+                        .selectable_value(&mut self.settings.mt_engine, MtEngine::Argos, "Argos (локально)")
+                        .clicked()
+                    {
+                        self.settings.engine_preset = EnginePreset::Custom;
+                    }
+                });
+            egui::ComboBox::from_label("Голос")
+                .selected_text(self.settings.tts_engine.as_str())
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_value(&mut self.settings.tts_engine, TtsEngine::Kokoro, "Kokoro")
+                        .clicked()
+                    {
+                        self.settings.engine_preset = EnginePreset::Custom;
+                    }
+                    if ui
+                        .selectable_value(&mut self.settings.tts_engine, TtsEngine::Chatterbox, "Chatterbox (клон)")
+                        .clicked()
+                    {
+                        self.settings.engine_preset = EnginePreset::Custom;
+                    }
+                    if ui
+                        .selectable_value(&mut self.settings.tts_engine, TtsEngine::Xtts, "XTTS v2 (клон)")
+                        .clicked()
+                    {
+                        self.settings.engine_preset = EnginePreset::Custom;
+                    }
+                });
+
+            let target_lang = self.settings.translate_to.clone();
+            if !target_lang.trim().is_empty()
+                && !engines::language_supported(
+                    self.settings.tts_engine,
+                    &target_lang,
+                    &self.engine_probe,
+                )
+            {
+                ui.colored_label(
+                    AMBER,
+                    format!("⚠ {} не поддерживает язык «{target_lang}»", self.settings.tts_engine.as_str()),
+                );
+            }
+            if self.settings.tts_engine.clones_voice() {
+                if !self.engine_probe.cuda {
+                    ui.colored_label(
+                        AMBER,
+                        "⚠ Клонирование голоса без CUDA работает очень медленно; выберите Kokoro или включите CUDA.",
+                    );
+                }
+                if !self.engine_probe.error.is_empty() {
+                    // The probe may have failed; do not claim the package exists.
+                } else if !self.engine_probe.has(self.settings.tts_engine.as_str()) {
+                    ui.colored_label(AMBER, "⚠ Пакет TTS не найден — проверьте компоненты ниже.");
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Образец голоса (wav):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.voice_sample)
+                            .hint_text("/path/to/voice.wav")
+                            .desired_width(220.0),
+                    );
+                });
+            }
+
+            if self.settings.asr_engine == AsrEngine::Groq {
+                ui.horizontal(|ui| {
+                    ui.label("Groq key:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.groq_api_key)
+                            .password(true)
+                            .desired_width(180.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Модель:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.groq_model)
+                            .desired_width(180.0),
+                    );
+                });
+                ui.label(small("При 429 автоматически используется локальный faster-whisper."));
+            }
+            if self.settings.mt_engine == MtEngine::OpenAi {
+                ui.horizontal(|ui| {
+                    ui.label("API base:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.openai_base_url)
+                            .desired_width(200.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("API key:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.openai_api_key)
+                            .password(true)
+                            .desired_width(180.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Модель:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.openai_model)
+                            .desired_width(180.0),
+                    );
+                });
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Проверить компоненты").clicked() {
+                    self.probe_busy = true;
+                    spawn_probe_worker(self.event_tx.clone());
+                }
+                if self.state.engine_running {
+                    ui.colored_label(GREEN, "● Движок запущен");
+                } else {
+                    ui.label(small("○ Движок не запущен"));
+                }
+            });
+            if self.probe_busy {
+                ui.label(small("Проверка Python и пакетов…"));
+            } else if !self.engine_probe.error.is_empty() {
+                ui.colored_label(RED, self.engine_probe.error.as_str());
+            } else {
+                ui.label(small(format!(
+                    "Python {} · CUDA: {}",
+                    self.engine_probe.python,
+                    if self.engine_probe.cuda { "да" } else { "нет" }
+                )));
+                let installed: Vec<&str> = [
+                    ("faster-whisper", self.engine_probe.faster_whisper),
+                    ("argos", self.engine_probe.argos),
+                    ("kokoro", self.engine_probe.kokoro),
+                    ("chatterbox", self.engine_probe.chatterbox),
+                    ("xtts", self.engine_probe.xtts),
+                ]
+                .iter()
+                .filter(|(_, ok)| *ok)
+                .map(|(name, _)| *name)
+                .collect();
+                ui.label(small(format!(
+                    "Установлено: {}",
+                    if installed.is_empty() {
+                        "ничего (нужен Python 3)".to_string()
+                    } else {
+                        installed.join(", ")
+                    }
+                )));
+            }
+            ui.label(small(format!("Журнал: {}", engines::log_path().display())));
+            ui.label(small(
+                "Движок запускается демоном, только когда включён перевод.",
+            ));
+            if ui.button("Сохранить и применить").clicked() {
+                self.save_engines();
+            }
         });
 
         ui.add_space(12.0);
@@ -1427,6 +1680,17 @@ fn spawn_command_worker(rx: Receiver<crate::core::Command>, tx: Sender<UiEvent>)
                     let _ = tx.send(UiEvent::Notice(format!("Команда не выполнена: {error}")));
                 }
             }
+        })
+        .ok();
+}
+
+/// One-shot probe. The button in the translation tab calls it again on demand.
+fn spawn_probe_worker(tx: Sender<UiEvent>) {
+    thread::Builder::new()
+        .name("RustMIC-gui-probe".into())
+        .spawn(move || {
+            let result = engines::probe();
+            let _ = tx.send(UiEvent::Probe(result));
         })
         .ok();
 }

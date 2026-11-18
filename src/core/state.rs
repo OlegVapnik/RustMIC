@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{GateMode, Settings};
-use crate::{level, mixer, music, tiles};
+use crate::{engines, level, mixer, music, tiles};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -98,6 +98,8 @@ pub struct AppState {
     pub tiles: Vec<Tile>,
     /// External translator / PCM mixer status.
     pub translate: mixer::TranslateStatus,
+    /// True while the bundled Python translation engine is alive.
+    pub engine_running: bool,
     /// ID of the last command this daemon has applied.
     pub last_command_id: u64,
     pub updated_at: u64,
@@ -116,6 +118,7 @@ impl Default for AppState {
             track: None,
             tiles: Vec::new(),
             translate: mixer::status(),
+            engine_running: engines::running(),
             last_command_id: 0,
             updated_at: 0,
         }
@@ -144,6 +147,7 @@ impl AppState {
             track: None,
             tiles: Vec::new(),
             translate: mixer::status(),
+            engine_running: engines::running(),
             last_command_id: 0,
             updated_at: now(),
         }
@@ -163,6 +167,7 @@ impl AppState {
         self.track = music::status();
         self.tiles = tiles::load();
         self.translate = mixer::status();
+        self.engine_running = engines::running();
         self.updated_at = now();
     }
 }

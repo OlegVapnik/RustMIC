@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 use crate::config::SINK;
 use crate::config::{self, GateMode, Settings, MUSIC_SINK};
 use crate::core::TrackState;
+use crate::mixer;
 use crate::{command, logging};
 
 fn cache(name: &str) -> PathBuf {
@@ -302,18 +303,20 @@ pub fn start_control() {
         .ok();
 }
 
-fn ducking_possible(current: &Runtime) -> bool {
-    if !current.ducking {
-        return false;
-    }
+fn gate_is_active(current: &Runtime) -> bool {
     match current.gate_mode {
         GateMode::Voice => current.gate_voice > 0,
         GateMode::Level => current.gate_level_db < 0.0,
     }
 }
 
-fn effective_volume(current: &Runtime, gate_open: bool) -> u32 {
-    if gate_open && ducking_possible(current) {
+/// Music is ducked while the microphone gate is open, and also while the
+/// external translator is speaking. The latter is independent of gate mode so
+/// ducking still works when VAD is disabled.
+fn effective_volume(current: &Runtime, gate_open: bool, translate_active: bool) -> u32 {
+    let duck = current.ducking
+        && ((gate_is_active(current) && gate_open) || translate_active);
+    if duck {
         let factor = 10f32.powf(-current.ducking_db / 20.0);
         (current.music_volume as f32 * factor).round() as u32
     } else {
@@ -324,7 +327,8 @@ fn effective_volume(current: &Runtime, gate_open: bool) -> u32 {
 fn apply_volume() {
     let current = runtime().read().map(|r| r.clone()).unwrap_or_else(|e| e.into_inner().clone());
     let gate_open = crate::level::read_meter().gate_open;
-    let value = effective_volume(&current, gate_open);
+    let translate_active = mixer::status().active;
+    let value = effective_volume(&current, gate_open, translate_active);
     let _ = mpv_request(&json!(["set_property", "volume", value]));
 }
 
@@ -801,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn ducking_lowers_volume_only_when_gate_is_active() {
+    fn ducking_follows_gate_and_translation() {
         let mut rt = Runtime {
             music_volume: 100,
             ducking: true,
@@ -812,10 +816,14 @@ mod tests {
             gate_voice: 40,
             gate_level_db: -45.0,
         };
-        assert!(effective_volume(&rt, true) < 100);
-        assert_eq!(effective_volume(&rt, false), 100);
+        assert!(effective_volume(&rt, true, false) < 100);
+        assert_eq!(effective_volume(&rt, false, false), 100);
+        assert!(effective_volume(&rt, false, true) < 100);
         rt.gate_voice = 0;
-        assert_eq!(effective_volume(&rt, true), 100);
+        assert_eq!(effective_volume(&rt, true, false), 100);
+        assert!(effective_volume(&rt, true, true) < 100);
+        rt.ducking = false;
+        assert_eq!(effective_volume(&rt, true, true), 100);
     }
 
     #[test]

@@ -24,7 +24,7 @@ use rustmic_mic::audio::{self, Sink};
 use rustmic_mic::config::{self, GateMode, Settings, TranslateMode};
 use rustmic_mic::core::{AppState, Command};
 use rustmic_mic::denoise::{Denoiser, Live};
-use rustmic_mic::{adb, ipc, level, logging, mixer, music, platform, tiles, STOP};
+use rustmic_mic::{adb, engines, ipc, level, logging, mixer, music, platform, tiles, STOP};
 
 fn install_signals() {
     #[cfg(unix)]
@@ -48,6 +48,26 @@ fn live_from(settings: &Settings, muted: bool) -> Live {
         mic_volume: settings.mic_volume,
         muted,
     }
+}
+
+/// Everything that requires restarting the bundled Python engine.
+fn engine_signature(settings: &Settings) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        settings.translate_enabled,
+        settings.engine_preset.as_str(),
+        settings.asr_engine.as_str(),
+        settings.mt_engine.as_str(),
+        settings.tts_engine.as_str(),
+        settings.translate_from,
+        settings.translate_to,
+        settings.groq_api_key,
+        settings.groq_model,
+        settings.openai_base_url,
+        settings.openai_api_key,
+        settings.openai_model,
+        settings.voice_sample
+    )
 }
 
 fn parse_percent(value: &str) -> u32 {
@@ -215,8 +235,8 @@ fn pump(
             continue;
         }
         den.process(&samples, &mut out);
-        // The translator receives clean voice; whatever it sends back is mixed
-        // into the same PCM stream before it reaches the virtual microphone.
+        // Tap point: publish clean voice BEFORE mixing. If we published the
+        // mixed stream, the translator would hear its own speech and loop.
         mixer::publish_voice(&out);
         let mixed = mixer::process(&out);
         sink.write(&mixed)?;
@@ -308,6 +328,9 @@ fn run(cfg: Settings, stats: bool) -> i32 {
     music::start_control();
     mixer::configure(&cfg);
     mixer::start_servers();
+    if let Err(error) = engines::restart(&cfg) {
+        log(&format!("translation engine did not start: {error}"));
+    }
 
     #[cfg(unix)]
     rustmic_mic::audio::linux::set_source_volume(cfg.mic_volume);
@@ -337,6 +360,7 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                 let mut settings = Settings::load();
                 let mut muted = live.read().map(|live| live.muted).unwrap_or(false);
                 let mut save = false;
+                let mut engine_changed = false;
                 match command {
                     Command::Ping | Command::GetState => {}
                     Command::SetMicVolume { value } => {
@@ -393,11 +417,13 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                     Command::SetTranslate { enabled } => {
                         settings.translate_enabled = enabled;
                         save = true;
+                        engine_changed = true;
                     }
                     Command::SetTranslateLanguages { from, to } => {
                         settings.translate_from = from;
                         settings.translate_to = to;
                         save = true;
+                        engine_changed = true;
                     }
                     Command::SetTranslateMode { mode } => {
                         settings.translate_mode = mode;
@@ -406,6 +432,31 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                     Command::SetTranslateVolume { value } => {
                         settings.translate_volume = value.min(100);
                         save = true;
+                    }
+                    Command::SetEngines {
+                        preset,
+                        asr,
+                        mt,
+                        tts,
+                        groq_key,
+                        groq_model,
+                        openai_base,
+                        openai_key,
+                        openai_model,
+                        voice_sample,
+                    } => {
+                        settings.engine_preset = preset;
+                        settings.asr_engine = asr;
+                        settings.mt_engine = mt;
+                        settings.tts_engine = tts;
+                        settings.groq_api_key = groq_key;
+                        settings.groq_model = groq_model;
+                        settings.openai_base_url = openai_base;
+                        settings.openai_api_key = openai_key;
+                        settings.openai_model = openai_model;
+                        settings.voice_sample = voice_sample;
+                        save = true;
+                        engine_changed = true;
                     }
                     Command::Play { query } => {
                         if let Err(error) = music::play(&settings, &query) {
@@ -446,6 +497,11 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                 if save {
                     if let Err(error) = settings.save() {
                         log(&format!("cannot save settings: {error}"));
+                    }
+                }
+                if engine_changed {
+                    if let Err(error) = engines::restart(&settings) {
+                        log(&format!("translation engine restart failed: {error}"));
                     }
                 }
                 music::configure(&settings);
@@ -523,9 +579,11 @@ fn run(cfg: Settings, stats: bool) -> i32 {
     // without a restart (a restart storm used to trip systemd's start limit).
     {
         let live = live.clone();
+        let initial = cfg.clone();
         thread::spawn(move || {
             let path = config::settings_path();
             let mut stamp = fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let mut engine_sig = engine_signature(&initial);
             while !STOP.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(1));
                 let now = fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -535,6 +593,13 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                 stamp = now;
                 let settings = Settings::load();
                 let muted = live.read().map(|live| live.muted).unwrap_or(false);
+                let next_sig = engine_signature(&settings);
+                if next_sig != engine_sig {
+                    engine_sig = next_sig;
+                    if let Err(error) = engines::restart(&settings) {
+                        log(&format!("translation engine restart failed: {error}"));
+                    }
+                }
                 music::configure(&settings);
                 mixer::configure(&settings);
                 update_live(&live, &settings, muted);
@@ -581,6 +646,7 @@ fn run(cfg: Settings, stats: bool) -> i32 {
         backoff = (backoff * 2).min(30);
     }
 
+    engines::stop();
     level::clear();
     ipc::cleanup();
     let _ = fs::remove_file(&pidfile);

@@ -14,6 +14,7 @@ pub mod audio;
 pub mod config;
 pub mod core;
 pub mod denoise;
+pub mod engines;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod ipc;

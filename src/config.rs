@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Bump whenever the meaning of a key changes. Older files are upgraded on load.
-pub const CONFIG_VERSION: u32 = 3;
+pub const CONFIG_VERSION: u32 = 4;
 
 /// PipeWire null sink fed by `pacat` (Linux).
 pub const SINK: &str = "rustmic_sink";
@@ -80,6 +80,138 @@ impl TranslateMode {
     }
 }
 
+/// Speech recognition backend used by the built-in translator pipeline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsrEngine {
+    #[default]
+    FasterWhisper,
+    Groq,
+}
+
+impl AsrEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FasterWhisper => "faster_whisper",
+            Self::Groq => "groq",
+        }
+    }
+    pub fn parse(value: &str) -> Self {
+        match value.trim().trim_matches('"').to_lowercase().as_str() {
+            "groq" | "groq_whisper" => Self::Groq,
+            _ => Self::FasterWhisper,
+        }
+    }
+}
+
+/// Machine-translation backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MtEngine {
+    #[default]
+    OpenAi,
+    Argos,
+}
+
+impl MtEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Argos => "argos",
+        }
+    }
+    pub fn parse(value: &str) -> Self {
+        match value.trim().trim_matches('"').to_lowercase().as_str() {
+            "argos" | "argostranslate" => Self::Argos,
+            _ => Self::OpenAi,
+        }
+    }
+}
+
+/// Speech synthesis backend. Chatterbox and XTTS clone a supplied voice;
+/// Kokoro only uses fixed voices.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsEngine {
+    #[default]
+    Kokoro,
+    Chatterbox,
+    Xtts,
+}
+
+impl TtsEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chatterbox => "chatterbox",
+            Self::Xtts => "xtts",
+            Self::Kokoro => "kokoro",
+        }
+    }
+    pub fn parse(value: &str) -> Self {
+        match value.trim().trim_matches('"').to_lowercase().as_str() {
+            "chatterbox" => Self::Chatterbox,
+            "xtts" | "xtts_v2" | "coqui" => Self::Xtts,
+            _ => Self::Kokoro,
+        }
+    }
+    pub fn clones_voice(self) -> bool {
+        matches!(self, Self::Chatterbox | Self::Xtts)
+    }
+}
+
+/// One-click engine bundles offered in the GUI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnginePreset {
+    /// Free cloud ASR/MT with a cloned local voice.
+    FreeVoice,
+    /// Fast local ASR/TTS, optionally cloud MT.
+    #[default]
+    Light,
+    /// Everything local; no API keys.
+    Offline,
+    /// Cloud ASR + cloud MT, local TTS.
+    Cloud,
+    Custom,
+}
+
+impl EnginePreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FreeVoice => "free_voice",
+            Self::Light => "light",
+            Self::Offline => "offline",
+            Self::Cloud => "cloud",
+            Self::Custom => "custom",
+        }
+    }
+    pub fn parse(value: &str) -> Self {
+        match value.trim().trim_matches('"').to_lowercase().as_str() {
+            "free_voice" | "free" | "бесплатный со своим голосом" => Self::FreeVoice,
+            "offline" | "офлайн" => Self::Offline,
+            "cloud" | "облако" => Self::Cloud,
+            "custom" | "свой" => Self::Custom,
+            _ => Self::Light,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FreeVoice => "Бесплатный со своим голосом",
+            Self::Light => "Лёгкий",
+            Self::Offline => "Офлайн",
+            Self::Cloud => "Облако",
+            Self::Custom => "Своя связка",
+        }
+    }
+    pub const ALL: &'static [Self] = &[
+        Self::FreeVoice,
+        Self::Light,
+        Self::Offline,
+        Self::Cloud,
+        Self::Custom,
+    ];
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     /// Schema version read from `config.toml`.
@@ -123,6 +255,21 @@ pub struct Settings {
     pub translate_mode: TranslateMode,
     /// Translated speech gain 0..100 %.
     pub translate_volume: u32,
+
+    // ---- step 6: built-in translator engines ----
+    pub engine_preset: EnginePreset,
+    pub asr_engine: AsrEngine,
+    pub mt_engine: MtEngine,
+    pub tts_engine: TtsEngine,
+    /// Groq API key for Whisper. Falls back to local ASR on 429.
+    pub groq_api_key: String,
+    pub groq_model: String,
+    /// Any OpenAI-compatible chat/completions endpoint.
+    pub openai_base_url: String,
+    pub openai_api_key: String,
+    pub openai_model: String,
+    /// Path to a voice sample (wav/mp3) for Chatterbox / XTTS cloning.
+    pub voice_sample: String,
 }
 
 impl Default for Settings {
@@ -150,6 +297,16 @@ impl Default for Settings {
             translate_to: "en".to_string(),
             translate_mode: TranslateMode::Replace,
             translate_volume: 100,
+            engine_preset: EnginePreset::Light,
+            asr_engine: AsrEngine::FasterWhisper,
+            mt_engine: MtEngine::Argos,
+            tts_engine: TtsEngine::Kokoro,
+            groq_api_key: String::new(),
+            groq_model: "whisper-large-v3".to_string(),
+            openai_base_url: "https://api.openai.com/v1".to_string(),
+            openai_api_key: String::new(),
+            openai_model: "gpt-4o-mini".to_string(),
+            voice_sample: String::new(),
         }
     }
 }
@@ -231,6 +388,28 @@ impl Settings {
                 }
                 "translate_mode" => self.translate_mode = TranslateMode::parse(value),
                 "translate_volume" => self.translate_volume = parse_percent(value),
+                "engine_preset" => self.engine_preset = EnginePreset::parse(value),
+                "asr_engine" => self.asr_engine = AsrEngine::parse(value),
+                "mt_engine" => self.mt_engine = MtEngine::parse(value),
+                "tts_engine" => self.tts_engine = TtsEngine::parse(value),
+                "groq_api_key" => self.groq_api_key = value.to_string(),
+                "groq_model" => {
+                    if !value.is_empty() {
+                        self.groq_model = value.to_string();
+                    }
+                }
+                "openai_base_url" => {
+                    if !value.is_empty() {
+                        self.openai_base_url = value.to_string();
+                    }
+                }
+                "openai_api_key" => self.openai_api_key = value.to_string(),
+                "openai_model" => {
+                    if !value.is_empty() {
+                        self.openai_model = value.to_string();
+                    }
+                }
+                "voice_sample" => self.voice_sample = value.to_string(),
                 "device" => {
                     if !value.is_empty() {
                         self.device = value.to_string();
@@ -287,6 +466,16 @@ impl Settings {
         text.push_str(&format!("translate_to = \"{}\"\n", self.translate_to));
         text.push_str(&format!("translate_mode = \"{}\"\n", self.translate_mode.as_str()));
         text.push_str(&format!("translate_volume = {}\n", self.translate_volume));
+        text.push_str(&format!("engine_preset = \"{}\"\n", self.engine_preset.as_str()));
+        text.push_str(&format!("asr_engine = \"{}\"\n", self.asr_engine.as_str()));
+        text.push_str(&format!("mt_engine = \"{}\"\n", self.mt_engine.as_str()));
+        text.push_str(&format!("tts_engine = \"{}\"\n", self.tts_engine.as_str()));
+        text.push_str(&format!("groq_api_key = \"{}\"\n", self.groq_api_key));
+        text.push_str(&format!("groq_model = \"{}\"\n", self.groq_model));
+        text.push_str(&format!("openai_base_url = \"{}\"\n", self.openai_base_url));
+        text.push_str(&format!("openai_api_key = \"{}\"\n", self.openai_api_key));
+        text.push_str(&format!("openai_model = \"{}\"\n", self.openai_model));
+        text.push_str(&format!("voice_sample = \"{}\"\n", self.voice_sample));
         if cfg!(windows) {
             text.push_str(&format!("device = \"{}\"\n", self.device));
         }
@@ -465,7 +654,10 @@ pub fn default_adb() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_transport, parse_volume, GateMode, Settings, TranslateMode};
+    use super::{
+        normalize_transport, parse_volume, AsrEngine, EnginePreset, GateMode, MtEngine, Settings,
+        TtsEngine, TranslateMode,
+    };
 
     #[test]
     fn volume_defaults_to_100_for_missing_or_invalid_values() {
@@ -528,5 +720,22 @@ mod tests {
         assert_eq!(settings.translate_to, "de");
         assert_eq!(settings.translate_mode, TranslateMode::Mix);
         assert_eq!(settings.translate_volume, 65);
+    }
+
+    #[test]
+    fn engine_settings_are_parsed() {
+        let mut settings = Settings::default();
+        settings.apply(
+            "engine_preset = \"free_voice\"\nasr_engine = \"groq\"\nmt_engine = \"openai\"\n\
+             tts_engine = \"chatterbox\"\ngroq_api_key = \"gsk_test\"\n\
+             openai_base_url = \"https://api.example.com/v1\"\nvoice_sample = \"me.wav\"\n",
+        );
+        assert_eq!(settings.engine_preset, EnginePreset::FreeVoice);
+        assert_eq!(settings.asr_engine, AsrEngine::Groq);
+        assert_eq!(settings.mt_engine, MtEngine::OpenAi);
+        assert_eq!(settings.tts_engine, TtsEngine::Chatterbox);
+        assert_eq!(settings.groq_api_key, "gsk_test");
+        assert_eq!(settings.openai_base_url, "https://api.example.com/v1");
+        assert_eq!(settings.voice_sample, "me.wav");
     }
 }

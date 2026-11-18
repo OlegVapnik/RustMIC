@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "RustMIC"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cpal",
  "ctrlc",
@@ -18,6 +18,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tray-icon",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
