@@ -52,15 +52,60 @@ fn read_u64(bytes: &[u8], at: &mut usize) -> Option<u64> {
     Some(u64::from_le_bytes(slice.try_into().ok()?))
 }
 
+/// Find the appended container.
+///
+/// The marker is also a string literal inside this launcher, so the first hit
+/// in `.rdata` is not the payload. The real container is the last marker that
+/// still parses into a complete file table ending exactly at the end of the
+/// image, so search backwards and validate before accepting a candidate.
+fn find_container(bytes: &[u8]) -> Option<usize> {
+    let mut end = bytes.len();
+    while end >= MARKER.len() {
+        let pos = bytes[..end]
+            .windows(MARKER.len())
+            .rposition(|window| window == MARKER)?;
+        let mut at = pos + MARKER.len();
+        if let Some(count) = read_u32(bytes, &mut at) {
+            if count > 0 && count <= 4096 && walks_to_eof(bytes, at, count) {
+                return Some(pos + MARKER.len());
+            }
+        }
+        // Resume the backwards search strictly before this candidate.
+        end = pos + MARKER.len() - 1;
+    }
+    None
+}
+
+/// Follow the file table without copying data; true when it ends at EOF.
+fn walks_to_eof(bytes: &[u8], mut at: usize, count: u32) -> bool {
+    for _ in 0..count {
+        let Some(name_len) = read_u32(bytes, &mut at) else {
+            return false;
+        };
+        let name_len = name_len as usize;
+        if name_len == 0 || name_len > 512 || bytes.get(at..at.saturating_add(name_len)).is_none() {
+            return false;
+        }
+        at += name_len;
+        let Some(data_len) = read_u64(bytes, &mut at) else {
+            return false;
+        };
+        let Ok(data_len) = usize::try_from(data_len) else {
+            return false;
+        };
+        if bytes.get(at..at.saturating_add(data_len)).is_none() {
+            return false;
+        }
+        at += data_len;
+    }
+    at == bytes.len()
+}
+
 /// Parse the appended container and write every file, creating subdirectories.
 fn extract(exe: &Path, target: &Path) -> Result<usize, String> {
     let bytes = fs::read(exe).map_err(|error| format!("не удалось прочитать {exe:?}: {error}"))?;
-    let start = bytes
-        .windows(MARKER.len())
-        .position(|window| window == MARKER)
-        .ok_or_else(|| "в exe нет встроенного контейнера (нужен RustMIC-portable.exe)".to_string())?
-        + MARKER.len();
-    let mut at = start;
+    let mut at = find_container(&bytes)
+        .ok_or_else(|| "в exe нет встроенного контейнера (нужен RustMIC-portable.exe)".to_string())?;
     let count = read_u32(&bytes, &mut at).ok_or("битый контейнер: нет счётчика")?;
     let mut written = 0;
     for _ in 0..count {
@@ -85,8 +130,15 @@ fn extract(exe: &Path, target: &Path) -> Result<usize, String> {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("не удалось создать {parent:?}: {error}"))?;
         }
-        fs::write(&path, data)
-            .map_err(|error| format!("не удалось записать {path:?}: {error}"))?;
+        // Re-running the portable exe while the GUI is open must not fail on
+        // locked binaries: identical files are left alone.
+        let up_to_date = fs::metadata(&path)
+            .map(|meta| meta.len() == data.len() as u64)
+            .unwrap_or(false);
+        if !up_to_date {
+            fs::write(&path, data)
+                .map_err(|error| format!("не удалось записать {path:?}: {error}"))?;
+        }
         written += 1;
     }
     Ok(written)
@@ -138,12 +190,10 @@ fn write_default_config(dir: &Path) {
     // Wi-Fi = no cable. The GUI asks for the phone IP on first launch.
     let text = concat!(
         "# RustMIC settings (managed by RustMIC-gui)\n",
+        "config_version = 6\n",
         "transport = \"wifi\"\n",
         "host = \"\"\n",
         "bt_address = \"\"\n",
-        "denoise = true\n",
-        "gate = 0.00\n",
-        "volume = 100\n",
         "device = \"CABLE Input\"\n",
     );
     let _ = fs::write(path, text);

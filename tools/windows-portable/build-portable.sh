@@ -11,8 +11,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HERE="$ROOT/tools/windows-portable"
-LLVM_ROOT="${LLVM_MINGW_ROOT:-/tmp/opencode/llvm-mingw/opt/llvm-mingw}"
-STUBS="${MINGW_STUB_DIR:-/tmp/opencode/llvm-mingw-stubs}"
+# llvm-mingw lives under ~/.cache so a /tmp cleanup cannot break the build;
+# an explicit LLVM_MINGW_ROOT still wins.
+DEFAULT_LLVM="$(ls -d "$HOME"/.cache/llvm-mingw/llvm-mingw-* 2>/dev/null | tail -n 1)"
+LLVM_ROOT="${LLVM_MINGW_ROOT:-${DEFAULT_LLVM:-/tmp/opencode/llvm-mingw/opt/llvm-mingw}}"
+STUBS="${MINGW_STUB_DIR:-$HOME/.cache/llvm-mingw-stubs}"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 if [ -d "$LLVM_ROOT/bin" ]; then
