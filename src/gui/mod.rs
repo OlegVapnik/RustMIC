@@ -459,17 +459,30 @@ impl App {
                 });
             });
             ui.add_space(8.0);
+            let system_source = connection.source == "system";
             dot_row(
                 ui,
-                "Поток",
-                if connection.client_running {
+                if system_source { "Захват" } else { "Поток" },
+                if system_source {
+                    if self.service_running() {
+                        "системный звук"
+                    } else {
+                        "служба остановлена"
+                    }
+                } else if connection.client_running {
                     "идёт"
                 } else if !self.service_running() {
                     "служба остановлена"
                 } else {
                     "нет"
                 },
-                if connection.client_running { GREEN } else { AMBER },
+                if system_source {
+                    if self.service_running() { GREEN } else { AMBER }
+                } else if connection.client_running {
+                    GREEN
+                } else {
+                    AMBER
+                },
             );
             dot_row(
                 ui,
@@ -485,7 +498,12 @@ impl App {
                     RED
                 },
             );
-            if !connection.phone_connected {
+            if system_source {
+                ui.add_space(4.0);
+                ui.label(small(
+                    "В микрофон идёт всё, что играет на компьютере: вкладки браузера, плееры, игры.",
+                ));
+            } else if !connection.phone_connected {
                 ui.add_space(4.0);
                 ui.label(small("Проверьте кабель, Wi-Fi или Bluetooth и запустите WO Mic на телефоне."));
             }
@@ -880,8 +898,10 @@ impl App {
                 }
             }
 
-            let mut monitor = self.state.audio.monitor_music;
             let monitor_enabled = !cfg!(windows);
+            // On Windows the setting may still be `true` in config.toml; show
+            // it as off so the disabled switch does not look active.
+            let mut monitor = self.state.audio.monitor_music && monitor_enabled;
             if toggle_row(
                 ui,
                 "Слышать музыку в колонках",
@@ -1036,63 +1056,88 @@ impl App {
         card(ui, "Подключение", |ui| {
             let mut changed = false;
 
-            let before = self.settings.transport.clone();
+            let source_before = self.settings.source.clone();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Канал").size(13.0).color(TEXT));
+                ui.label(RichText::new("Источник звука").size(13.0).color(TEXT));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("transport")
-                        .selected_text(transport_label(&self.settings.transport))
+                    egui::ComboBox::from_id_salt("source")
+                        .selected_text(source_label(&self.settings.source))
                         .show_ui(ui, |ui| {
-                            for transport in config::TRANSPORTS {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.settings.transport,
-                                        transport.to_string(),
-                                        transport_label(transport),
-                                    )
-                                    .clicked()
-                                {
-                                    changed = true;
-                                }
+                            for source in config::SOURCES {
+                                ui.selectable_value(
+                                    &mut self.settings.source,
+                                    source.to_string(),
+                                    source_label(source),
+                                );
                             }
                         });
                 });
             });
-            if before != self.settings.transport {
+            if source_before != self.settings.source {
                 changed = true;
             }
 
-            if self.settings.transport == "wifi" || self.settings.transport == "wifi-direct" {
+            if self.settings.source == "system" {
                 ui.add_space(6.0);
-                ui.label("IP телефона (WO Mic, TCP 7800)");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.settings.host)
-                            .hint_text("192.168.1.50")
-                            .desired_width(ui.available_width()),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
                 ui.label(small(
-                    "Телефон и компьютер должны быть в одной Wi-Fi сети. Кабель не нужен.",
+                    "Захватывается звук устройства вывода по умолчанию: вкладки браузера (YouTube Music, uwupad.me, SoundCloud), плееры, игры. Телефон и adb не нужны.",
                 ));
-            } else if self.settings.transport == "bluetooth" {
+            } else {
                 ui.add_space(6.0);
-                ui.label("Bluetooth MAC-адрес телефона");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.settings.bt_address)
-                            .hint_text("AA:BB:CC:DD:EE:FF")
-                            .desired_width(ui.available_width()),
-                    )
-                    .changed()
-                {
+                let before = self.settings.transport.clone();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Канал").size(13.0).color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("transport")
+                            .selected_text(transport_label(&self.settings.transport))
+                            .show_ui(ui, |ui| {
+                                for transport in config::TRANSPORTS {
+                                    ui.selectable_value(
+                                        &mut self.settings.transport,
+                                        transport.to_string(),
+                                        transport_label(transport),
+                                    );
+                                }
+                            });
+                    });
+                });
+                if before != self.settings.transport {
                     changed = true;
                 }
-            } else {
-                ui.label(small("USB: телефон подключён кабелем, нужен adb."));
+
+                if self.settings.transport == "wifi" || self.settings.transport == "wifi-direct" {
+                    ui.add_space(6.0);
+                    ui.label("IP телефона (WO Mic, TCP 7800)");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.settings.host)
+                                .hint_text("192.168.1.50")
+                                .desired_width(ui.available_width()),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.label(small(
+                        "Телефон и компьютер должны быть в одной Wi-Fi сети. Кабель не нужен.",
+                    ));
+                } else if self.settings.transport == "bluetooth" {
+                    ui.add_space(6.0);
+                    ui.label("Bluetooth MAC-адрес телефона");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.settings.bt_address)
+                                .hint_text("AA:BB:CC:DD:EE:FF")
+                                .desired_width(ui.available_width()),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                } else {
+                    ui.add_space(6.0);
+                    ui.label(small("USB: телефон подключён кабелем, нужен adb."));
+                }
             }
 
             if cfg!(windows) {
@@ -1482,6 +1527,13 @@ fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.end_row();
 }
 
+fn source_label(source: &str) -> &'static str {
+    match source {
+        "system" => "Системный звук (loopback)",
+        _ => "Телефон (WO Mic)",
+    }
+}
+
 fn transport_label(transport: &str) -> &'static str {
     match transport {
         "wifi" => "Wi-Fi",
@@ -1558,12 +1610,25 @@ fn slider_row(
 
         let value_width = 58.0;
         let slider_width = (ui.available_width() - value_width - 8.0).max(60.0);
-        let response = ui.add_sized(
-            Vec2::new(slider_width, 20.0),
-            egui::Slider::new(value, range)
-                .show_value(false)
-                .trailing_fill(false),
-        );
+        // egui draws sliders at `spacing.slider_width`, ignoring `add_sized`,
+        // so widen the rail explicitly for the duration of this row.
+        let previous_slider_width = ui.spacing().slider_width;
+        ui.spacing_mut().slider_width = slider_width;
+        let response = ui
+            .scope(|ui| {
+                // Bright handle so it stands out against the dark rail.
+                ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(70, 82, 98);
+                ui.visuals_mut().widgets.hovered.bg_fill = ACCENT;
+                ui.visuals_mut().widgets.active.bg_fill = ACCENT;
+                ui.add_sized(
+                    Vec2::new(slider_width, 20.0),
+                    egui::Slider::new(value, range)
+                        .show_value(false)
+                        .trailing_fill(true),
+                )
+            })
+            .inner;
+        ui.spacing_mut().slider_width = previous_slider_width;
         changed = response.changed();
         committed = response.drag_stopped()
             || (response.changed() && !ui.input(|i| i.pointer.any_down()));
@@ -1654,6 +1719,14 @@ fn dot_row(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
 fn connection_summary(
     connection: &crate::core::ConnectionState,
 ) -> (String, &'static str, Color32) {
+    if connection.source == "system" {
+        let (text, color) = if connection.sink_present {
+            ("захват включён", GREEN)
+        } else {
+            ("нет вывода", AMBER)
+        };
+        return ("Системный звук · loopback".to_string(), text, color);
+    }
     let transport = transport_label(&connection.transport);
     let title = match phone_model(&connection.phone) {
         Some(model) => format!("{model} · {transport}"),

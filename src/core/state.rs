@@ -9,6 +9,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ConnectionState {
+    /// `phone` (WO Mic) or `system` (loopback of the default output).
+    #[serde(default)]
+    pub source: String,
     /// usb / wifi / wifi-direct / bluetooth
     pub transport: String,
     /// Phone IP or Bluetooth MAC, for display.
@@ -134,6 +137,7 @@ impl AppState {
             daemon_pid: std::process::id(),
             service_running: false,
             connection: ConnectionState {
+                source: settings.source.clone(),
                 transport: settings.transport.clone(),
                 target,
                 ..ConnectionState::default()

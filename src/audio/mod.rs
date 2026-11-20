@@ -17,6 +17,9 @@ pub trait Sink {
     fn describe(&self) -> String;
 }
 
+/// Loopback capture of everything the computer plays.
+pub mod system;
+
 #[cfg(unix)]
 pub mod linux;
 #[cfg(windows)]

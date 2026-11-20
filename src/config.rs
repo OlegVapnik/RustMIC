@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Bump whenever the meaning of a key changes. Older files are upgraded on load.
-pub const CONFIG_VERSION: u32 = 6;
+pub const CONFIG_VERSION: u32 = 7;
 
 /// PipeWire null sink fed by `pacat` (Linux).
 pub const SINK: &str = "rustmic_sink";
@@ -21,6 +21,9 @@ pub const SRC: &str = "rustmic_mic";
 pub const MUSIC_SINK: &str = "rustmic_music";
 /// Transports understood by the bundled `rustmic` client.
 pub const TRANSPORTS: &[&str] = &["usb", "wifi", "wifi-direct", "bluetooth"];
+/// Where the audio fed into the virtual microphone comes from: the phone or
+/// everything the computer plays (browser tabs, players, calls).
+pub const SOURCES: &[&str] = &["phone", "system"];
 /// Default substring of the Windows playback endpoint that feeds the cable.
 pub const DEFAULT_DEVICE: &str = "CABLE Input";
 /// Name of the scheduled task / autostart entry.
@@ -57,6 +60,8 @@ impl GateMode {
 pub struct Settings {
     /// Schema version read from `config.toml`.
     pub config_version: u32,
+    /// `phone` (WO Mic capture) or `system` (loopback of the default output).
+    pub source: String,
     /// `usb` (adb), `wifi` / `wifi-direct` (phone IP) or `bluetooth`.
     pub transport: String,
     /// IP of the phone running the WO Mic server (Wi-Fi transports).
@@ -98,6 +103,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             config_version: CONFIG_VERSION,
+            source: "phone".to_string(),
             transport: "usb".to_string(),
             host: String::new(),
             bt_address: String::new(),
@@ -153,6 +159,7 @@ impl Settings {
                 "config_version" => {
                     self.config_version = value.parse::<u32>().unwrap_or(0);
                 }
+                "source" => self.source = normalize_source(value),
                 "transport" => self.transport = normalize_transport(value),
                 "host" => {
                     if !value.is_empty() {
@@ -218,6 +225,7 @@ impl Settings {
         }
         let mut text = String::from("# RustMIC settings (managed by RustMIC-gui)\n");
         text.push_str(&format!("config_version = {CONFIG_VERSION}\n"));
+        text.push_str(&format!("source = \"{}\"\n", self.source));
         text.push_str(&format!("transport = \"{}\"\n", self.transport));
         text.push_str(&format!("host = \"{}\"\n", self.host));
         text.push_str(&format!("bt_address = \"{}\"\n", self.bt_address));
@@ -277,6 +285,14 @@ fn parse_db_amount(value: &str) -> f32 {
 }
 
 /// Lowercase transport name, with common aliases folded in.
+/// `source` accepts `phone` and `system` (alias `loopback`).
+pub fn normalize_source(value: &str) -> String {
+    match value.trim().trim_matches('"').to_lowercase().as_str() {
+        "system" | "loopback" | "pc" | "desktop" => "system".to_string(),
+        _ => "phone".to_string(),
+    }
+}
+
 pub fn normalize_transport(value: &str) -> String {
     let value = value.trim().trim_matches('"').to_lowercase();
     match value.as_str() {

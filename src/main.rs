@@ -249,13 +249,28 @@ fn rustmic_args(cfg: &Settings) -> Result<Vec<String>, String> {
 }
 
 fn session(cfg: &Settings, live: &Arc<RwLock<Live>>, stats: bool) -> Result<(), String> {
+    let mut sink = audio::open(cfg, live)?;
+    log(&format!("sink: {}", sink.describe()));
+
+    let mut den = Denoiser::new(live.clone());
+    den.stats = stats;
+
+    // System source: capture everything the computer plays (browser tabs,
+    // players, calls) instead of the phone microphone.
+    if cfg.source == "system" {
+        let (chunks, description) = audio::system::stream()?;
+        log(&format!("capture: {description}"));
+        let result = pump(&chunks, sink.as_mut(), &mut den);
+        if result.is_ok() {
+            log("системный захват прервался, перезапуск");
+        }
+        return result.map_err(|error| format!("audio pump: {error}"));
+    }
+
     let args = rustmic_args(cfg)?;
     if cfg.transport == "usb" {
         adb::forward(&cfg.adb);
     }
-
-    let mut sink = audio::open(cfg, live)?;
-    log(&format!("sink: {}", sink.describe()));
 
     let client = config::client_program();
     let mut mic = rustmic_mic::command(&client)
@@ -266,15 +281,26 @@ fn session(cfg: &Settings, live: &Arc<RwLock<Live>>, stats: bool) -> Result<(), 
         .spawn()
         .map_err(|error| format!("cannot start {client}: {error}"))?;
 
-    let mut den = Denoiser::new(live.clone());
-    den.stats = stats;
     let result = {
         let out = mic.stdout.take().expect("rustmic stdout");
         pump(&reader(out), sink.as_mut(), &mut den)
     };
 
+    // Explain the reconnect loop instead of leaving a bare "session ended".
+    let exit = mic.try_wait().ok().flatten();
     let _ = mic.kill();
     let _ = mic.wait();
+    match exit {
+        Some(status) if !status.success() => {
+            log(&format!("{client} exited with {status}"));
+        }
+        Some(_) => log(&format!("{client} finished")),
+        None if result.is_ok() => log(&format!("{client} closed the audio stream")),
+        None => {}
+    }
+    if result.is_ok() {
+        log("проверьте, что на телефоне запущено приложение WO Mic и оно в режиме USB/Wi-Fi");
+    }
     result.map_err(|error| format!("audio pump: {error}"))
 }
 
@@ -285,7 +311,8 @@ fn run(cfg: Settings, stats: bool) -> i32 {
     let _ = fs::create_dir_all(config::cache_dir());
     audio::prepare();
     log(&format!(
-        "starting (transport={}, host={}, adb={}, device={}, denoise={}, gate_mode={}, gate_voice={}%, gate_level={:.1}dB, mic_volume={}%)",
+        "starting (source={}, transport={}, host={}, adb={}, device={}, denoise={}, gate_mode={}, gate_voice={}%, gate_level={:.1}dB, mic_volume={}%)",
+        cfg.source,
         cfg.transport,
         cfg.host,
         cfg.adb,
@@ -482,6 +509,7 @@ fn run(cfg: Settings, stats: bool) -> i32 {
                     // microphone service is by definition running.
                     state.service_running = true;
                     state.daemon_pid = std::process::id();
+                    state.connection.source = settings.source.clone();
                     state.connection.transport = settings.transport.clone();
                     state.connection.target = target_of(&settings);
                     state.connection.phone = phone;
@@ -536,7 +564,10 @@ fn run(cfg: Settings, stats: bool) -> i32 {
     while !STOP.load(Ordering::SeqCst) {
         // Only USB needs adb. Wi-Fi / Bluetooth are handled by rustmic's own
         // reconnect loop, so the supervisor never blocks on a missing cable.
-        if cfg.transport == "usb" && last_devices_check.elapsed() >= Duration::from_secs(3) {
+        if cfg.source == "phone"
+            && cfg.transport == "usb"
+            && last_devices_check.elapsed() >= Duration::from_secs(3)
+        {
             last_devices_check = Instant::now();
             if !adb::phone_ready(&cfg.adb) {
                 log("phone not connected over adb, waiting");
